@@ -1,12 +1,18 @@
 import { useMemo, useState } from 'react';
-import { useTick } from '@/hooks/useTick';
-import { mock } from '@/mock';
+import { getTopApps } from '@/api';
+import { useApi } from '@/hooks/useApi';
 
 type SortKey = 'total' | 'cpu' | 'gpu' | 'name';
 
 export function Apps() {
-  useTick(2000);
-  const apps = mock.getAllApps();
+  const appsData = useApi(getTopApps, 2000);
+  // Make sure each row has the optional decoration fields the page uses.
+  // Real backend rows don't have iconHint / hog yet, so we derive them.
+  const apps = (appsData ?? []).map((a) => ({
+    ...a,
+    iconHint: a.name.charAt(0).toUpperCase(),
+    hog: a.totalW > 3,
+  }));
 
   const [query, setQuery] = useState('');
   const [sortKey, setSortKey] = useState<SortKey>('total');

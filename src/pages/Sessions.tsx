@@ -1,4 +1,4 @@
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import {
   Area,
   AreaChart,
@@ -8,18 +8,36 @@ import {
   XAxis,
   YAxis,
 } from 'recharts';
-import { useTick } from '@/hooks/useTick';
+import {
+  getBatterySessions,
+  getSessionDetail,
+  getSleepDetail,
+  getSleepSessions,
+} from '@/api';
+import { useApi } from '@/hooks/useApi';
 import { mock } from '@/mock';
 import type { BatterySession, SleepSession } from '@/types';
 
 type Tab = 'battery' | 'sleep';
 
 export function Sessions() {
-  useTick(10_000);
   const [tab, setTab] = useState<Tab>('battery');
-  const sessions = mock.getAllBatterySessions();
-  const sleeps = mock.getAllSleepSessions();
-  const [openId, setOpenId] = useState<number | null>(sessions[0]?.id ?? null);
+  const sessionsData = useApi(getBatterySessions, 10_000);
+  const sleepsData = useApi(getSleepSessions, 10_000);
+  const sessions = sessionsData ?? [];
+  const sleeps = sleepsData ?? [];
+  const [openId, setOpenId] = useState<number | null>(null);
+  // When data first arrives, open the most recent session.
+  useEffect(() => {
+    if (openId === null && sessions.length > 0 && tab === 'battery') {
+      setOpenId(sessions[0].id);
+    }
+  }, [sessions, tab, openId]);
+  useEffect(() => {
+    if (openId === null && sleeps.length > 0 && tab === 'sleep') {
+      setOpenId(sleeps[0].id);
+    }
+  }, [sleeps, tab, openId]);
 
   return (
     <div className="page">
@@ -139,23 +157,36 @@ function BatterySessionRow({
   open: boolean;
   onToggle: () => void;
 }) {
-  const detail = useMemo(
-    () => mock.getBatterySessionDetail(session),
-    // We deliberately memoize on the id+endedAt so the detail is stable
-    // for closed sessions but refreshes for the still-open one.
+  // Async load — only fetch when this row is open.
+  const [detail, setDetail] = useState<ReturnType<typeof mock.getBatterySessionDetail> | null>(null);
+  useEffect(() => {
+    if (!open) return;
+    let cancelled = false;
+    getSessionDetail(session.id).then((d) => {
+      if (!cancelled) setDetail(d);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [session.id, open]);
+
+  // Fall back to a quick mock detail for the inline sparkline so the row
+  // shows something even when not open.
+  const sparkDetail = useMemo(
+    () => detail ?? mock.getBatterySessionDetail(session),
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [session.id, session.endedAt],
+    [session.id, detail],
   );
   const isOpen = session.endedAt === null;
-  const durLabel = humanDuration(detail.durationSec);
+  const durLabel = humanDuration(sparkDetail.durationSec);
   const dateLabel = formatDateRange(session.startedAt, session.endedAt);
   const timeAgoLabel = formatTimeAgo(session.startedAt);
 
   // Sparkline preview for closed rows: 20-point downsample
   const spark = useMemo(() => {
-    const stride = Math.max(1, Math.floor(detail.history.length / 20));
-    return detail.history.filter((_, i) => i % stride === 0);
-  }, [detail.history]);
+    const stride = Math.max(1, Math.floor(sparkDetail.history.length / 20));
+    return sparkDetail.history.filter((_, i) => i % stride === 0);
+  }, [sparkDetail.history]);
 
   return (
     <div style={{ borderBottom: '1px solid var(--border)' }}>
@@ -255,7 +286,12 @@ function BatterySessionRow({
         <span style={{ color: 'var(--text-muted)' }}>{open ? '▾' : '▸'}</span>
       </button>
 
-      {open && <BatterySessionDetailView session={session} detail={detail} />}
+      {open && detail && <BatterySessionDetailView session={session} detail={detail} />}
+      {open && !detail && (
+        <div style={{ padding: '0 24px 20px 48px', color: 'var(--text-muted)', fontSize: 13 }}>
+          loading session detail…
+        </div>
+      )}
     </div>
   );
 }
@@ -470,11 +506,17 @@ function SleepSessionRow({
   open: boolean;
   onToggle: () => void;
 }) {
-  const detail = useMemo(
-    () => mock.getSleepSessionDetail(sleep),
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-    [sleep.id],
-  );
+  const [detail, setDetail] = useState<ReturnType<typeof mock.getSleepSessionDetail> | null>(null);
+  useEffect(() => {
+    if (!open) return;
+    let cancelled = false;
+    getSleepDetail(sleep.id).then((d) => {
+      if (!cancelled) setDetail(d);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [sleep.id, open]);
   const dur =
     sleep.wakeAt !== null ? humanDuration(sleep.wakeAt - sleep.sleepAt) : '—';
 
@@ -526,7 +568,12 @@ function SleepSessionRow({
         <span style={{ color: 'var(--text-muted)' }}>{open ? '▾' : '▸'}</span>
       </button>
 
-      {open && <SleepSessionDetailView sleep={sleep} detail={detail} />}
+      {open && detail && <SleepSessionDetailView sleep={sleep} detail={detail} />}
+      {open && !detail && (
+        <div style={{ padding: '0 24px 24px 48px', color: 'var(--text-muted)', fontSize: 13 }}>
+          loading sleep detail…
+        </div>
+      )}
     </div>
   );
 }

@@ -7,13 +7,25 @@ import {
   XAxis,
   YAxis,
 } from 'recharts';
-import { useTick } from '@/hooks/useTick';
-import { mock } from '@/mock';
+import { getBatteryStatus, getHealthHistory } from '@/api';
+import { useApi } from '@/hooks/useApi';
 
 export function Health() {
-  useTick(30_000);
-  const status = mock.getStatus();
-  const history = mock.getHealthHistory();
+  const status = useApi(getBatteryStatus, 30_000);
+  const historyData = useApi(getHealthHistory, 60_000);
+
+  if (!status || !historyData || historyData.length === 0) {
+    return (
+      <div className="page">
+        <div className="page-header">
+          <h1 className="page-title">Health</h1>
+          <p className="page-subtitle">Loading…</p>
+        </div>
+      </div>
+    );
+  }
+
+  const history = historyData;
   const latest = history[history.length - 1];
   const first = history[0];
 

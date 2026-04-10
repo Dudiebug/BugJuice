@@ -7,19 +7,38 @@ import {
   XAxis,
   YAxis,
 } from 'recharts';
+import {
+  getBatteryHistory,
+  getBatteryStatus,
+  getPowerReading,
+  getTopApps,
+  isLive,
+} from '@/api';
 import { BatteryGauge } from '@/components/BatteryGauge';
-import { useTick } from '@/hooks/useTick';
-import { mock, toggleMockPowerSource } from '@/mock';
+import { useApi } from '@/hooks/useApi';
+import { toggleMockPowerSource } from '@/mock';
 
 export function Dashboard() {
-  useTick(2000);
-  const status = mock.getStatus();
-  const power = mock.getPower();
-  const apps = mock.getApps().slice(0, 6);
-  const history = mock.getHistory(60);
+  const status = useApi(getBatteryStatus, 2000);
+  const power = useApi(getPowerReading, 2000);
+  const appsAll = useApi(getTopApps, 2000);
+  const history = useApi(() => getBatteryHistory(60), 30_000);
 
+  if (!status || !power) {
+    return (
+      <div className="page">
+        <div className="page-header">
+          <h1 className="page-title">Dashboard</h1>
+          <p className="page-subtitle">Loading…</p>
+        </div>
+      </div>
+    );
+  }
+
+  const apps = (appsAll ?? []).slice(0, 6);
   const rateAbs = Math.abs(status.rateW);
   const charging = status.rateW > 0;
+  const live = isLive();
 
   return (
     <div className="page">
@@ -50,21 +69,23 @@ export function Dashboard() {
               </strong>
             </div>
           </div>
-          <button
-            onClick={toggleMockPowerSource}
-            style={{
-              padding: '8px 16px',
-              borderRadius: 'var(--radius-sm)',
-              background: 'var(--bg-inset)',
-              color: 'var(--text-subtle)',
-              fontSize: 12,
-              border: '1px solid var(--border)',
-              whiteSpace: 'nowrap',
-            }}
-            title="Prototype-only: flip AC/DC to see how the numbers move"
-          >
-            toggle {status.onAc ? 'DC' : 'AC'}
-          </button>
+          {!live && (
+            <button
+              onClick={toggleMockPowerSource}
+              style={{
+                padding: '8px 16px',
+                borderRadius: 'var(--radius-sm)',
+                background: 'var(--bg-inset)',
+                color: 'var(--text-subtle)',
+                fontSize: 12,
+                border: '1px solid var(--border)',
+                whiteSpace: 'nowrap',
+              }}
+              title="Demo mode only: flip AC/DC to see how the numbers move"
+            >
+              toggle {status.onAc ? 'DC' : 'AC'}
+            </button>
+          )}
         </div>
       </section>
 
@@ -94,7 +115,7 @@ export function Dashboard() {
         </div>
         <div style={{ height: 220 }}>
           <ResponsiveContainer width="100%" height="100%">
-            <AreaChart data={history} margin={{ top: 10, right: 6, left: -10, bottom: 0 }}>
+            <AreaChart data={history ?? []} margin={{ top: 10, right: 6, left: -10, bottom: 0 }}>
               <defs>
                 <linearGradient id="batteryFill" x1="0" y1="0" x2="0" y2="1">
                   <stop offset="0%" stopColor="var(--accent)" stopOpacity={0.45} />

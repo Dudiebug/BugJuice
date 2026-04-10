@@ -10,8 +10,8 @@ import {
   XAxis,
   YAxis,
 } from 'recharts';
-import { useTick } from '@/hooks/useTick';
-import { mock } from '@/mock';
+import { getComponentHistory, getPowerReading } from '@/api';
+import { useApi } from '@/hooks/useApi';
 
 interface Slice {
   name: string;
@@ -21,9 +21,19 @@ interface Slice {
 }
 
 export function Components() {
-  useTick(2000);
-  const power = mock.getPower();
-  const history = mock.getComponentHistory(20);
+  const power = useApi(getPowerReading, 2000);
+  const history = useApi(() => getComponentHistory(20), 30_000);
+
+  if (!power) {
+    return (
+      <div className="page">
+        <div className="page-header">
+          <h1 className="page-title">Components</h1>
+          <p className="page-subtitle">Loading…</p>
+        </div>
+      </div>
+    );
+  }
 
   const cpu = power.cpuPackageW ?? 0;
   const gpu = power.gpuW ?? 0;
@@ -184,7 +194,7 @@ export function Components() {
         </div>
         <div style={{ height: 260 }}>
           <ResponsiveContainer width="100%" height="100%">
-            <AreaChart data={history} margin={{ top: 10, right: 12, left: -8, bottom: 0 }}>
+            <AreaChart data={history ?? []} margin={{ top: 10, right: 12, left: -8, bottom: 0 }}>
               <defs>
                 {(['cpu', 'gpu', 'dram', 'other'] as const).map((key, i) => (
                   <linearGradient
