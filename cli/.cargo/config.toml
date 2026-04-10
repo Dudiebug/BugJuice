@@ -1,0 +1,6 @@
+# Statically link the MSVC C runtime so built binaries have no external
+# DLL dependencies. Without this, running on a machine without the
+# Visual C++ Redistributable installed fails with STATUS_DLL_NOT_FOUND
+# (0xC0000135).
+[target.'cfg(target_env = "msvc")']
+rustflags = ["-C", "target-feature=+crt-static"]

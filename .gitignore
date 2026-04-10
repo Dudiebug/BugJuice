@@ -1,1 +1,29 @@
+# Scope / planning docs (kept local only)
 BugJuice Scope.pdf
+BugJuice-Claude-Code-Scope.md
+BugJuice-Build-Plan.md
+
+# Rust
+target/
+**/*.rs.bk
+
+# Node / Vite
+node_modules/
+dist/
+dist-ssr/
+*.local
+.vite/
+
+# TypeScript build artifacts
+*.tsbuildinfo
+vite.config.js
+vite.config.d.ts
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# OS
+Thumbs.db
+.DS_Store
