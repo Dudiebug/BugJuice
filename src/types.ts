@@ -32,6 +32,12 @@ export interface PowerReading {
   gpuW: number | null;          // PP1 or GPU channel
   dramW: number | null;         // DRAM (Intel only)
   source: string;               // "EMI v2 — Qualcomm 8380" / "Microsoft PPM"
+  channels: PowerChannel[];     // Raw per-channel values for diagnostics
+}
+
+export interface PowerChannel {
+  name: string;
+  watts: number;
 }
 
 export interface AppPowerRow {

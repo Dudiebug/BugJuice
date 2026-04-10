@@ -14,7 +14,7 @@ export function Health() {
   const status = useApi(getBatteryStatus, 30_000);
   const historyData = useApi(getHealthHistory, 60_000);
 
-  if (!status || !historyData || historyData.length === 0) {
+  if (!status) {
     return (
       <div className="page">
         <div className="page-header">
@@ -25,17 +25,37 @@ export function Health() {
     );
   }
 
-  const history = historyData;
-  const latest = history[history.length - 1];
-  const first = history[0];
+  const history = historyData ?? [];
+  // We always have the *current* snapshot from getBatteryStatus. The
+  // historical chart is only meaningful once we have ≥ 2 snapshots spread
+  // across real time.
+  const latest = history.length > 0 ? history[history.length - 1] : {
+    ts: Math.floor(Date.now() / 1000),
+    designCapacity: status.designMwh,
+    fullChargeCapacity: status.fullChargeMwh,
+    cycleCount: status.cycleCount,
+    wearPercent: status.wearPercent,
+  };
+  const first = history.length > 0 ? history[0] : latest;
 
-  const healthPct = 100 - latest.wearPercent;
-  const wearRatePerMonth = (latest.wearPercent - first.wearPercent) / 11;
+  const healthPct = Math.max(0, 100 - latest.wearPercent);
   const expectedLifespanCycles = 1000;
   const cyclesRemaining = Math.max(0, expectedLifespanCycles - latest.cycleCount);
-  const monthsOfUse = 11;
-  const cyclesPerMonth = latest.cycleCount / Math.max(1, monthsOfUse);
-  const monthsUntilReplace = Math.round(cyclesRemaining / Math.max(0.1, cyclesPerMonth));
+
+  // Real months-of-use and wear rate: only compute when we have snapshots
+  // that actually span some time. Otherwise we don't know — show an em-dash.
+  const spanSec = latest.ts - first.ts;
+  const spanMonths = spanSec / (60 * 60 * 24 * 30.44);
+  const haveRealTrend = history.length >= 2 && spanMonths >= 0.25; // ≥ ~1 week
+  const wearDelta = latest.wearPercent - first.wearPercent;
+  const wearRatePerMonth = haveRealTrend ? wearDelta / spanMonths : null;
+  const cyclesPerMonth = haveRealTrend
+    ? (latest.cycleCount - first.cycleCount) / spanMonths
+    : null;
+  const monthsUntilReplace =
+    cyclesPerMonth && cyclesPerMonth > 0.1
+      ? Math.round(cyclesRemaining / cyclesPerMonth)
+      : null;
 
   return (
     <div className="page">
@@ -72,13 +92,21 @@ export function Health() {
             value={latest.wearPercent.toFixed(1)}
             unit="%"
             label="Wear"
-            context={`~${wearRatePerMonth.toFixed(2)}% per month`}
+            context={
+              wearRatePerMonth !== null
+                ? `~${wearRatePerMonth.toFixed(2)}% per month`
+                : 'trend unavailable yet'
+            }
           />
           <HeroStat
-            value={monthsUntilReplace.toString()}
-            unit="mo"
+            value={monthsUntilReplace !== null ? monthsUntilReplace.toString() : '—'}
+            unit={monthsUntilReplace !== null ? 'mo' : ''}
             label="Projected lifespan"
-            context="at current usage rate"
+            context={
+              monthsUntilReplace !== null
+                ? 'at current usage rate'
+                : 'needs ≥ 1 week of data'
+            }
           />
         </div>
       </section>
@@ -89,11 +117,13 @@ export function Health() {
           <div>
             <div className="card-title">Capacity over time</div>
             <div className="card-subtitle">
-              Full-charge capacity across the last {history.length} months
+              {history.length < 2
+                ? 'Collecting health snapshots — one per minute of runtime'
+                : `Full-charge capacity across ${formatSpan(spanSec)} (${history.length} snapshots)`}
             </div>
           </div>
           <span className="badge badge-ok">
-            {((latest.fullChargeCapacity / latest.designCapacity) * 100).toFixed(0)}% of design
+            {((latest.fullChargeCapacity / Math.max(1, latest.designCapacity)) * 100).toFixed(0)}% of design
           </span>
         </div>
         <div style={{ height: 280 }}>
@@ -160,10 +190,11 @@ export function Health() {
         <div className="card">
           <div className="card-title">Charge habits</div>
           <p style={{ marginTop: 12, color: 'var(--text-subtle)', fontSize: 14 }}>
-            You mostly keep the battery between <strong>30%</strong> and <strong>90%</strong>,
-            which is ideal for lithium-ion longevity. Avoiding full-to-empty
-            cycles and keeping below 90% at night can extend lifespan by
-            <strong> 20-40%</strong>.
+            BugJuice will analyse your charge habits once it has collected a
+            few complete battery sessions. In the meantime, the generally
+            safe guidance for lithium-ion: keep the battery between{' '}
+            <strong>20%</strong> and <strong>80%</strong> most of the time,
+            and avoid leaving it at 100% for long periods.
           </p>
           <div
             style={{
@@ -175,8 +206,8 @@ export function Health() {
               color: 'var(--text-subtle)',
             }}
           >
-            <strong style={{ color: 'var(--text)' }}>Tip:</strong> consider
-            enabling BugJuice's 80% charge-limit reminder in Settings.
+            <strong style={{ color: 'var(--text)' }}>Tip:</strong> enable
+            BugJuice's 80% charge-limit reminder in Settings.
           </div>
         </div>
 
@@ -252,6 +283,18 @@ function SpecRow({ label, value }: { label: string; value: string }) {
       <span style={{ fontWeight: 500 }}>{value}</span>
     </div>
   );
+}
+
+function formatSpan(sec: number): string {
+  if (sec < 60) return `${Math.round(sec)}s`;
+  const min = sec / 60;
+  if (min < 60) return `${Math.round(min)} min`;
+  const hr = min / 60;
+  if (hr < 48) return `${hr.toFixed(1)} hours`;
+  const days = hr / 24;
+  if (days < 60) return `${Math.round(days)} days`;
+  const months = days / 30.44;
+  return `${months.toFixed(1)} months`;
 }
 
 function healthVerdict(pct: number): string {

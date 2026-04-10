@@ -27,18 +27,13 @@
   --border-strong: rgba(0, 0, 0, 0.14);
 
   /* Accent = Windows system accent color.
-     CSS system colors `AccentColor` / `AccentColorText` resolve to the
-     user's actual Windows 11 accent when the browser supports them
-     (Chrome/Edge 115+, Safari 16.5+). In older browsers the second
-     declaration is ignored and the BugJuice green falls through.
-     The derived soft / hover variants use color-mix() for the same
-     adaptive behavior. */
+     The Rust backend reads the accent from the registry and applies it
+     via inline CSS variables in main.tsx. These are the BugJuice-green
+     fallbacks used when the backend isn't available. */
   --accent: #22c55e;
-  --accent: AccentColor;
-  --accent-hover: color-mix(in srgb, AccentColor 82%, black 18%);
-  --accent-soft: color-mix(in srgb, AccentColor 14%, transparent);
+  --accent-hover: color-mix(in srgb, #22c55e 82%, black 18%);
+  --accent-soft: color-mix(in srgb, #22c55e 14%, transparent);
   --accent-text: #ffffff;
-  --accent-text: AccentColorText;
 
   /* Lime used for emphasis (matches logo eyes/bolt) */
   --lime: #4ade80;
@@ -55,7 +50,6 @@
   /* Chart colors — chart-1 is the system accent so primary series match
      the rest of the UI. Secondary colors stay fixed for contrast. */
   --chart-1: #22c55e;
-  --chart-1: AccentColor;
   --chart-2: #4ade80;
   --chart-3: #86efac;
   --chart-4: #3b82f6;
@@ -118,20 +112,18 @@
     --border: rgba(255, 255, 255, 0.08);
     --border-strong: rgba(255, 255, 255, 0.14);
 
-    /* System accent still wins; fallback is BugJuice lime for dark. */
+    /* BugJuice lime fallback for dark mode. The Rust backend overrides
+       these with the real Windows accent via inline styles. */
     --accent: #4ade80;
-    --accent: AccentColor;
-    --accent-hover: color-mix(in srgb, AccentColor 82%, white 18%);
-    --accent-soft: color-mix(in srgb, AccentColor 18%, transparent);
+    --accent-hover: color-mix(in srgb, #4ade80 82%, white 18%);
+    --accent-soft: color-mix(in srgb, #4ade80 18%, transparent);
     --accent-text: #0a1a10;
-    --accent-text: AccentColorText;
 
     --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.2), 0 0 0 1px rgba(255, 255, 255, 0.04);
     --shadow: 0 2px 8px rgba(0, 0, 0, 0.3), 0 0 0 1px rgba(255, 255, 255, 0.05);
     --shadow-lg: 0 8px 24px rgba(0, 0, 0, 0.5);
 
     --chart-1: #4ade80;
-    --chart-1: AccentColor;
     --chart-2: #86efac;
     --chart-3: #22c55e;
     --chart-4: #60a5fa;
@@ -144,6 +136,31 @@
 
 :root[data-theme='light'] {
   color-scheme: light;
+  /* Explicit light overrides — needed because @media (prefers-color-scheme: dark)
+     would otherwise win when the OS is in dark mode. */
+  --bg-base: #f3f3f3;
+  --bg-mica: rgba(252, 252, 252, 0.85);
+  --bg-card: #ffffff;
+  --bg-inset: rgba(0, 0, 0, 0.03);
+  --bg-input: #ffffff;
+  --text: #1a1a1a;
+  --text-subtle: #5d5d5d;
+  --text-muted: #8a8a8a;
+  --border: rgba(0, 0, 0, 0.08);
+  --border-strong: rgba(0, 0, 0, 0.14);
+  --accent: #22c55e;
+  --accent-hover: color-mix(in srgb, #22c55e 82%, black 18%);
+  --accent-soft: color-mix(in srgb, #22c55e 14%, transparent);
+  --accent-text: #ffffff;
+  --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.04), 0 0 0 1px rgba(0, 0, 0, 0.04);
+  --shadow: 0 2px 8px rgba(0, 0, 0, 0.06), 0 0 0 1px rgba(0, 0, 0, 0.06);
+  --shadow-lg: 0 8px 24px rgba(0, 0, 0, 0.12);
+  --chart-1: #22c55e;
+  --chart-2: #4ade80;
+  --chart-3: #86efac;
+  --chart-4: #3b82f6;
+  --chart-5: #f59e0b;
+  --chart-6: #ef4444;
 }
 
 :root[data-theme='dark'] {
@@ -159,16 +176,13 @@
   --border: rgba(255, 255, 255, 0.08);
   --border-strong: rgba(255, 255, 255, 0.14);
   --accent: #4ade80;
-  --accent: AccentColor;
-  --accent-hover: color-mix(in srgb, AccentColor 82%, white 18%);
-  --accent-soft: color-mix(in srgb, AccentColor 18%, transparent);
+  --accent-hover: color-mix(in srgb, #4ade80 82%, white 18%);
+  --accent-soft: color-mix(in srgb, #4ade80 18%, transparent);
   --accent-text: #0a1a10;
-  --accent-text: AccentColorText;
   --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.2), 0 0 0 1px rgba(255, 255, 255, 0.04);
   --shadow: 0 2px 8px rgba(0, 0, 0, 0.3), 0 0 0 1px rgba(255, 255, 255, 0.05);
   --shadow-lg: 0 8px 24px rgba(0, 0, 0, 0.5);
   --chart-1: #4ade80;
-  --chart-1: AccentColor;
   --chart-2: #86efac;
   --chart-3: #22c55e;
   --chart-4: #60a5fa;

@@ -13,10 +13,20 @@
 // before the battery session is rotated. That way a flicker or a brief
 // charger disconnect doesn't create a new row in battery_sessions.
 
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crate::battery::{self, BATTERY_POWER_ON_LINE, BATTERY_UNKNOWN_CAPACITY, BATTERY_UNKNOWN_RATE};
+use crate::battery::{
+    self, BATTERY_CHARGING, BATTERY_DISCHARGING, BATTERY_POWER_ON_LINE, BATTERY_UNKNOWN_CAPACITY,
+    BATTERY_UNKNOWN_RATE,
+};
+
+static LAST_BATTERY_RATE_W: AtomicU64 = AtomicU64::new(0);
+
+pub fn last_battery_rate_w() -> f64 {
+    f64::from_bits(LAST_BATTERY_RATE_W.load(AtomicOrdering::Relaxed))
+}
 use crate::events;
 use crate::gpu::GpuQuery;
 use crate::power;
@@ -42,6 +52,20 @@ struct PollState {
     /// A tentative state that differs from committed — waiting to see if
     /// it holds long enough to be the new committed state.
     pending_transition: Option<(bool, Instant)>,
+    /// Whether the charge-limit notification has already been sent this
+    /// charge cycle (reset when percent drops below threshold - 2%).
+    charge_limit_notified: bool,
+    /// Whether the low-battery notification has already been sent this
+    /// discharge cycle (reset when percent rises above threshold + 2%).
+    low_battery_notified: bool,
+    /// Timestamp (unix secs) of the last periodic summary notification.
+    last_summary_ts: i64,
+    /// Battery percent when the last summary was sent (for delta calc).
+    summary_start_percent: Option<f64>,
+    /// Last hour boundary at which we aggregated readings into hourly_stats.
+    last_aggregated_hour: i64,
+    /// Last day boundary at which we aggregated hourly_stats into daily_stats.
+    last_aggregated_day: i64,
 }
 
 impl PollState {
@@ -53,6 +77,12 @@ impl PollState {
             gpu: GpuQuery::new(),
             committed_on_ac: None,
             pending_transition: None,
+            charge_limit_notified: false,
+            low_battery_notified: false,
+            last_summary_ts: 0,
+            summary_start_percent: None,
+            last_aggregated_hour: 0,
+            last_aggregated_day: 0,
         }
     }
 
@@ -177,11 +207,12 @@ fn tick(state: &mut PollState) {
         });
     }
 
-    // Power channels via EMI. Pick out CPU package and GPU totals for the
-    // per-process attribution below.
+    // Power channels via EMI. Read directly — same code path as the CLI.
+    // Pick out CPU package and GPU totals for the per-process attribution
+    // below.
     let mut cpu_package_watts: Option<f64> = None;
     let mut gpu_package_watts: Option<f64> = None;
-    if let Ok(readings) = power::read_all_emi(Duration::from_millis(200)) {
+    if let Ok(readings) = power::read_all_emi(Duration::from_secs(1)) {
         for r in readings {
             for ch in &r.channels {
                 batch.push(ReadingInput {
@@ -223,6 +254,85 @@ fn tick(state: &mut PollState) {
 
     // ── Per-process CPU + GPU power attribution ─────────────────────────────
     log_app_power(state, storage, cpu_package_watts, gpu_package_watts);
+
+    // ── Store battery rate for confidence score ──────────────────────────────
+    if snap.status.rate != BATTERY_UNKNOWN_RATE {
+        LAST_BATTERY_RATE_W.store(
+            (snap.status.rate as f64 / 1000.0).to_bits(),
+            AtomicOrdering::Relaxed,
+        );
+    }
+
+    // ── Tray tooltip + menu info update ────────────────────────────────────
+    if let Some(handle) = crate::app_handle() {
+        if let Some(tray) = handle.tray_by_id("main") {
+            let pct = if snap.status.capacity != BATTERY_UNKNOWN_CAPACITY && snap.info.full_charged_capacity > 0 {
+                snap.status.capacity as f64 / snap.info.full_charged_capacity as f64 * 100.0
+            } else {
+                0.0
+            };
+            let state_str = if on_ac { "plugged in" } else { "on battery" };
+            let tooltip = format!("BugJuice \u{2014} {pct:.0}% ({state_str})");
+            let _ = tray.set_tooltip(Some(&tooltip));
+
+            // Build info-item texts from the battery snapshot.
+            let charging = snap.status.power_state & BATTERY_CHARGING != 0;
+            let discharging = snap.status.power_state & BATTERY_DISCHARGING != 0;
+            let rate_known = snap.status.rate != BATTERY_UNKNOWN_RATE;
+            let rate_w = if rate_known {
+                snap.status.rate.unsigned_abs() as f64 / 1000.0
+            } else {
+                0.0
+            };
+
+            let state_text = if discharging && rate_known {
+                format!("Discharging at {rate_w:.1} W")
+            } else if charging && rate_known {
+                format!("Charging at {rate_w:.1} W")
+            } else if on_ac && !discharging {
+                if pct >= 99.0 {
+                    "Fully charged".to_string()
+                } else {
+                    "Plugged in".to_string()
+                }
+            } else if rate_known && rate_w > 0.0 {
+                format!("{rate_w:.1} W")
+            } else {
+                "Battery".to_string()
+            };
+
+            let eta_text = if let Some(secs) = snap.estimated_seconds {
+                let hours = secs as f64 / 3600.0;
+                let label = crate::format_hours(hours);
+                if discharging {
+                    format!("~{label} remaining")
+                } else if charging {
+                    format!("~{label} to full")
+                } else {
+                    String::new()
+                }
+            } else {
+                String::new()
+            };
+
+            // Update the disabled menu items via the global tray menu.
+            if let Some(menu) = crate::tray_menu() {
+                use tauri::menu::MenuItemKind;
+                if let Some(MenuItemKind::MenuItem(item)) = menu.get("info_state") {
+                    let _ = item.set_text(&state_text);
+                }
+                if let Some(MenuItemKind::MenuItem(item)) = menu.get("info_eta") {
+                    let _ = item.set_text(&eta_text);
+                }
+            }
+        }
+    }
+
+    // ── Notification checks ──────────────────────────────────────────────────
+    check_notifications(state, snap, on_ac);
+
+    // ── Tiered aggregation ───────────────────────────────────────────────────
+    check_aggregation(state, storage);
 
     // ── Periodic health snapshot ─────────────────────────────────────────────
     if state.last_health.elapsed() >= Duration::from_secs(60) {
@@ -324,6 +434,168 @@ fn log_app_power(
 
     state.prev_processes = Some(curr_procs);
     state.prev_cpu_totals = Some(curr_totals);
+}
+
+fn check_notifications(state: &mut PollState, snap: &battery::BatterySnapshot, on_ac: bool) {
+    let prefs = crate::commands::notification_prefs().lock().unwrap().clone();
+    let pct = if snap.status.capacity != BATTERY_UNKNOWN_CAPACITY && snap.info.full_charged_capacity > 0 {
+        snap.status.capacity as f64 / snap.info.full_charged_capacity as f64 * 100.0
+    } else {
+        return;
+    };
+
+    // Charge limit
+    if prefs.notify_charge && on_ac && pct >= prefs.charge_limit {
+        if !state.charge_limit_notified {
+            fire_notification(
+                "Charge Limit Reached",
+                &format!("Battery is at {pct:.0}%. Unplug to preserve battery health."),
+            );
+            state.charge_limit_notified = true;
+        }
+    } else if pct < prefs.charge_limit - 2.0 {
+        state.charge_limit_notified = false;
+    }
+
+    // Low battery
+    if prefs.notify_low && !on_ac && pct <= prefs.low_threshold {
+        if !state.low_battery_notified {
+            fire_notification(
+                "Low Battery",
+                &format!("Battery is at {pct:.0}%. Plug in soon."),
+            );
+            state.low_battery_notified = true;
+        }
+    } else if pct > prefs.low_threshold + 2.0 {
+        state.low_battery_notified = false;
+    }
+
+    // Periodic summary
+    if prefs.summary_enabled {
+        if prefs.summary_only_on_battery && on_ac {
+            // Skip summaries while plugged in
+            return;
+        }
+
+        let now_ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let interval_secs = prefs.summary_interval_min as i64 * 60;
+
+        // Initialize on first tick
+        if state.last_summary_ts == 0 {
+            state.last_summary_ts = now_ts;
+            state.summary_start_percent = Some(pct);
+            return;
+        }
+
+        if now_ts - state.last_summary_ts >= interval_secs {
+            let rate_w = if snap.status.rate != BATTERY_UNKNOWN_RATE {
+                snap.status.rate as f64 / 1000.0
+            } else {
+                0.0
+            };
+
+            let mut lines: Vec<String> = Vec::new();
+
+            if prefs.summary_show_rate {
+                let abs = rate_w.abs();
+                if rate_w > 0.0 {
+                    lines.push(format!("Charging at {abs:.1} W"));
+                } else if rate_w < 0.0 {
+                    lines.push(format!("Draining at {abs:.1} W"));
+                } else {
+                    lines.push("Idle".into());
+                }
+            }
+
+            if prefs.summary_show_delta {
+                if let Some(start_pct) = state.summary_start_percent {
+                    let delta = pct - start_pct;
+                    let sign = if delta >= 0.0 { "+" } else { "" };
+                    lines.push(format!("{sign}{delta:.1}% since last summary"));
+                }
+            }
+
+            if prefs.summary_show_eta {
+                if let Some(est) = snap.estimated_seconds {
+                    if est > 0 && est < 999999 {
+                        let h = est / 3600;
+                        let m = (est % 3600) / 60;
+                        if rate_w > 0.0 {
+                            lines.push(format!("~{h}h {m:02}m to full"));
+                        } else {
+                            lines.push(format!("~{h}h {m:02}m remaining"));
+                        }
+                    }
+                }
+            }
+
+            if prefs.summary_show_top_app {
+                if let Some(storage) = crate::storage::global() {
+                    if let Ok(apps) = storage.read_recent_app_power() {
+                        if let Some(top) = apps.first() {
+                            lines.push(format!(
+                                "Top app: {} ({:.1} W)",
+                                top.process_name, top.total_watts
+                            ));
+                        }
+                    }
+                }
+            }
+
+            if !lines.is_empty() {
+                fire_notification(
+                    &format!("Battery: {pct:.0}%"),
+                    &lines.join("\n"),
+                );
+            }
+
+            state.last_summary_ts = now_ts;
+            state.summary_start_percent = Some(pct);
+        }
+    }
+}
+
+pub fn fire_notification(title: &str, body: &str) {
+    if let Some(handle) = crate::app_handle() {
+        use tauri_plugin_notification::NotificationExt;
+        match handle.notification().builder().title(title).body(body).show() {
+            Ok(_) => println!("[notification] sent: {title}"),
+            Err(e) => println!("[notification] FAILED: {title} — {e}"),
+        }
+    } else {
+        println!("[notification] no app handle yet, skipping: {title}");
+    }
+}
+
+fn check_aggregation(state: &mut PollState, storage: &storage::Storage) {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    let current_hour = (now / 3600) * 3600;
+    let current_day = (now / 86400) * 86400;
+
+    if state.last_aggregated_hour == 0 {
+        state.last_aggregated_hour = current_hour;
+        state.last_aggregated_day = current_day;
+        return;
+    }
+
+    if current_hour > state.last_aggregated_hour {
+        let prev_hour = current_hour - 3600;
+        let _ = storage.aggregate_hour(prev_hour);
+        state.last_aggregated_hour = current_hour;
+    }
+
+    if current_day > state.last_aggregated_day {
+        let prev_day = current_day - 86400;
+        let _ = storage.aggregate_day(prev_day);
+        state.last_aggregated_day = current_day;
+    }
 }
 
 /// Make a sensor name SQLite-friendly: lowercase, ASCII, underscores.

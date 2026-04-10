@@ -12,16 +12,14 @@ import {
   getBatteryStatus,
   getPowerReading,
   getTopApps,
-  isLive,
 } from '@/api';
 import { BatteryGauge } from '@/components/BatteryGauge';
 import { useApi } from '@/hooks/useApi';
-import { toggleMockPowerSource } from '@/mock';
 
 export function Dashboard() {
   const status = useApi(getBatteryStatus, 2000);
   const power = useApi(getPowerReading, 2000);
-  const appsAll = useApi(getTopApps, 2000);
+  const appsResponse = useApi(getTopApps, 2000);
   const history = useApi(() => getBatteryHistory(60), 30_000);
 
   if (!status || !power) {
@@ -35,10 +33,9 @@ export function Dashboard() {
     );
   }
 
-  const apps = (appsAll ?? []).slice(0, 6);
+  const apps = (appsResponse?.apps ?? []).slice(0, 6);
   const rateAbs = Math.abs(status.rateW);
   const charging = status.rateW > 0;
-  const live = isLive();
 
   return (
     <div className="page">
@@ -69,23 +66,6 @@ export function Dashboard() {
               </strong>
             </div>
           </div>
-          {!live && (
-            <button
-              onClick={toggleMockPowerSource}
-              style={{
-                padding: '8px 16px',
-                borderRadius: 'var(--radius-sm)',
-                background: 'var(--bg-inset)',
-                color: 'var(--text-subtle)',
-                fontSize: 12,
-                border: '1px solid var(--border)',
-                whiteSpace: 'nowrap',
-              }}
-              title="Demo mode only: flip AC/DC to see how the numbers move"
-            >
-              toggle {status.onAc ? 'DC' : 'AC'}
-            </button>
-          )}
         </div>
       </section>
 
@@ -110,7 +90,7 @@ export function Dashboard() {
         <div className="card-header">
           <div>
             <div className="card-title">Battery — last hour</div>
-            <div className="card-subtitle">Percentage over time (simulated)</div>
+            <div className="card-subtitle">Percentage over time</div>
           </div>
         </div>
         <div style={{ height: 220 }}>
@@ -185,9 +165,15 @@ export function Dashboard() {
           <span className="badge badge-ok">live</span>
         </div>
         <div>
-          {apps.map((app) => (
-            <AppRow key={app.pid} app={app} maxWatts={apps[0].totalW} />
-          ))}
+          {apps.length === 0 ? (
+            <div className="stat-context" style={{ padding: '16px 4px' }}>
+              Collecting per-process power data…
+            </div>
+          ) : (
+            apps.map((app) => (
+              <AppRow key={app.pid} app={app} maxWatts={apps[0].totalW} />
+            ))
+          )}
         </div>
       </section>
 
@@ -240,7 +226,7 @@ function PowerCard({
       {watts !== null && watts !== undefined ? (
         <>
           <div className="stat-value" style={{ fontSize: 28 }}>
-            {watts.toFixed(2)}
+            {watts < 1 ? watts.toFixed(3) : watts.toFixed(2)}
             <span className="stat-unit"> W</span>
           </div>
           <div className="stat-context" style={{ marginTop: 4 }}>

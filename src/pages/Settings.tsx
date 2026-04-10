@@ -1,5 +1,17 @@
 import { useEffect, useState } from 'react';
-import { mock } from '@/mock';
+import { enableAutostart, disableAutostart, isAutostartEnabled, setNotificationPrefs } from '@/api';
+
+// Static example data for the notification preview. This is a design
+// preview only — the real notification in the tray uses live data.
+const PREVIEW_SUMMARY = {
+  avgRateW: -9.4,
+  startPercent: 78,
+  endPercent: 76,
+  deltaPercent: -2,
+  topApp: 'chrome.exe',
+  topAppW: 3.8,
+  onAc: false,
+};
 
 type Theme = 'system' | 'light' | 'dark';
 
@@ -57,14 +69,39 @@ function loadPrefs(): Prefs {
 
 export function Settings() {
   const [prefs, setPrefs] = useState<Prefs>(loadPrefs);
+  const [autostartReal, setAutostartReal] = useState(prefs.autostart);
+
+  // Load real autostart state from backend on mount
+  useEffect(() => {
+    isAutostartEnabled().then(setAutostartReal).catch(() => {});
+  }, []);
 
   useEffect(() => {
     localStorage.setItem('bugjuice-prefs', JSON.stringify(prefs));
+    // Sync notification prefs to Rust backend
+    setNotificationPrefs({
+      notifyCharge: prefs.notifyCharge,
+      chargeLimit: prefs.chargeLimit,
+      notifyLow: prefs.notifyLow,
+      lowThreshold: prefs.lowThreshold,
+      notifySleepDrain: prefs.notifySleepDrain,
+      summaryEnabled: prefs.summaryEnabled,
+      summaryIntervalMin: prefs.summaryIntervalMin,
+      summaryOnlyOnBattery: prefs.summaryOnlyOnBattery,
+      summaryShowRate: prefs.summaryShowRate,
+      summaryShowEta: prefs.summaryShowEta,
+      summaryShowDelta: prefs.summaryShowDelta,
+      summaryShowTopApp: prefs.summaryShowTopApp,
+    }).catch(() => {});
     const root = document.documentElement;
     if (prefs.theme === 'system') {
       root.removeAttribute('data-theme');
+      localStorage.removeItem('bugjuice-theme');
     } else {
       root.setAttribute('data-theme', prefs.theme);
+      // Persist for the early-load guard in main.tsx (reads 'bugjuice-theme'
+      // before React boots to avoid a flash of the wrong scheme).
+      localStorage.setItem('bugjuice-theme', prefs.theme);
     }
   }, [prefs]);
 
@@ -103,25 +140,6 @@ export function Settings() {
             ]}
             onChange={(v) => update('theme', v as Theme)}
           />
-        </SettingRow>
-        <SettingRow
-          label="Accent color"
-          help="Automatically matches your Windows accent color"
-        >
-          <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
-            <div
-              style={{
-                width: 32,
-                height: 32,
-                borderRadius: 6,
-                background: 'var(--accent)',
-                border: '2px solid var(--border)',
-              }}
-            />
-            <span style={{ color: 'var(--text-subtle)', fontSize: 13 }}>
-              synced from Windows Settings
-            </span>
-          </div>
         </SettingRow>
       </section>
 
@@ -345,8 +363,17 @@ export function Settings() {
           help="Launch BugJuice automatically at login"
         >
           <Toggle
-            checked={prefs.autostart}
-            onChange={(v) => update('autostart', v)}
+            checked={autostartReal}
+            onChange={async (v: boolean) => {
+              update('autostart', v);
+              try {
+                if (v) await enableAutostart();
+                else await disableAutostart();
+                setAutostartReal(v);
+              } catch (e) {
+                console.error('autostart toggle failed:', e);
+              }
+            }}
           />
         </SettingRow>
         <SettingRow
@@ -578,7 +605,8 @@ function CheckboxRow({
 }
 
 function NotificationPreview({ prefs }: { prefs: Prefs }) {
-  const summary = mock.getRecentSummary(prefs.summaryIntervalMin);
+  void prefs.summaryIntervalMin;
+  const summary = PREVIEW_SUMMARY;
   const charging = summary.avgRateW > 0;
   const rateAbs = Math.abs(summary.avgRateW);
 

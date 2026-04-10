@@ -1,11 +1,9 @@
 // Single source of truth for getting data into the React UI.
 //
-// When running inside Tauri, this calls real Rust backend commands via
-// `invoke()`. When running in a plain browser (vite preview / vite dev /
-// the GitHub Pages preview), it transparently falls back to mock data so
-// the UI still works for design iteration.
-//
-// Every page should import from `@/api` instead of `@/mock` directly.
+// This file ONLY talks to the real Rust backend via Tauri `invoke()`.
+// There is no mock fallback: if the backend isn't available or returns
+// nothing, we return empty/zero values and let pages render empty states.
+// Running outside Tauri (vite preview) will show empty states too.
 
 import type {
   AppPowerRow,
@@ -16,140 +14,247 @@ import type {
   PowerReading,
   SleepSession,
 } from './types';
-import { mock, type ComponentHistoryPoint, type SessionDetail, type SleepDetail } from './mock';
 
-// Detect Tauri at runtime. Tauri injects this global into the WebView.
+// ─── Detail shapes (were previously in mock.ts) ──────────────────────────
+
+export interface ComponentHistoryPoint {
+  ts: number;
+  cpu: number;
+  gpu: number;
+  dram: number;
+  other: number;
+}
+
+export interface AppPowerSummary {
+  name: string;
+  avgWatts: number;
+  maxWatts: number;
+  sampleCount: number;
+}
+
+export interface SessionDetailPoint {
+  ts: number;
+  percent: number;
+  rateW: number;
+}
+
+export interface SessionDetail {
+  history: SessionDetailPoint[];
+  minRateW: number;
+  maxRateW: number;
+  avgRateW: number;
+  totalEnergyMwh: number;
+  durationSec: number;
+}
+
+export interface SleepDetailPoint {
+  ts: number;
+  capacity: number;
+  drainRateMw: number;
+}
+
+export interface SleepDetail {
+  history: SleepDetailPoint[];
+  minRateMw: number;
+  maxRateMw: number;
+  avgRateMw: number;
+  totalDrainMwh: number;
+  durationSec: number;
+}
+
+// ─── Tauri plumbing ──────────────────────────────────────────────────────
+
 function inTauri(): boolean {
   return typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window;
 }
 
-// Lazily import @tauri-apps/api so the browser bundle still works when
-// the package's globals aren't present.
 async function tauriInvoke<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
   const { invoke } = await import('@tauri-apps/api/core');
   return invoke<T>(cmd, args);
 }
 
-// ─── Public API ──────────────────────────────────────────────────────────────
+// Safe wrapper: returns `fallback` if not in Tauri or if the call throws.
+async function safe<T>(cmd: string, fallback: T, args?: Record<string, unknown>): Promise<T> {
+  if (!inTauri()) return fallback;
+  try {
+    return await tauriInvoke<T>(cmd, args);
+  } catch (e) {
+    console.warn(`${cmd} failed:`, e);
+    return fallback;
+  }
+}
+
+// ─── Empty values ────────────────────────────────────────────────────────
+
+const EMPTY_BATTERY_STATUS: BatteryStatus = {
+  percent: 0,
+  capacityMwh: 0,
+  fullChargeMwh: 0,
+  designMwh: 0,
+  voltageV: 0,
+  rateW: 0,
+  powerState: 'idle',
+  onAc: false,
+  tempC: null,
+  etaMinutes: null,
+  etaLabel: 'No data yet',
+  chemistry: '',
+  cycleCount: 0,
+  wearPercent: 0,
+  manufacturer: '',
+  deviceName: '',
+};
+
+const EMPTY_POWER_READING: PowerReading = {
+  wallInputW: null,
+  systemDrawW: null,
+  cpuPackageW: null,
+  gpuW: null,
+  dramW: null,
+  source: 'No data yet',
+  channels: [],
+};
+
+const EMPTY_SESSION_DETAIL: SessionDetail = {
+  history: [],
+  minRateW: 0,
+  maxRateW: 0,
+  avgRateW: 0,
+  totalEnergyMwh: 0,
+  durationSec: 0,
+};
+
+const EMPTY_SLEEP_DETAIL: SleepDetail = {
+  history: [],
+  minRateMw: 0,
+  maxRateMw: 0,
+  avgRateMw: 0,
+  totalDrainMwh: 0,
+  durationSec: 0,
+};
+
+// ─── Public API ──────────────────────────────────────────────────────────
 
 export async function getBatteryStatus(): Promise<BatteryStatus> {
-  if (inTauri()) {
-    try {
-      return await tauriInvoke<BatteryStatus>('get_battery_status');
-    } catch (e) {
-      console.warn('get_battery_status failed, falling back to mock:', e);
-    }
-  }
-  return mock.getStatus();
+  return safe('get_battery_status', EMPTY_BATTERY_STATUS);
 }
 
 export async function getPowerReading(): Promise<PowerReading> {
-  if (inTauri()) {
-    try {
-      return await tauriInvoke<PowerReading>('get_power_reading');
-    } catch (e) {
-      console.warn('get_power_reading failed, falling back to mock:', e);
-    }
-  }
-  return mock.getPower();
+  return safe('get_power_reading', EMPTY_POWER_READING);
 }
 
-export async function getTopApps(): Promise<AppPowerRow[]> {
-  if (inTauri()) {
-    try {
-      const rows = await tauriInvoke<AppPowerRow[]>('get_top_apps');
-      // The first ~tick after launch the table is empty — fall back to
-      // current mock so the UI doesn't look dead.
-      if (rows.length > 0) return rows;
-    } catch (e) {
-      console.warn('get_top_apps failed:', e);
-    }
-  }
-  return mock.getApps();
+export interface TopAppsResponse {
+  apps: AppPowerRow[];
+  confidencePercent: number;
+  batteryDischargeW: number;
+}
+
+const EMPTY_TOP_APPS: TopAppsResponse = {
+  apps: [],
+  confidencePercent: 0,
+  batteryDischargeW: 0,
+};
+
+export async function getTopApps(): Promise<TopAppsResponse> {
+  return safe<TopAppsResponse>('get_top_apps', EMPTY_TOP_APPS);
 }
 
 export async function getBatteryHistory(minutes: number): Promise<HistoryPoint[]> {
-  if (inTauri()) {
-    try {
-      const rows = await tauriInvoke<HistoryPoint[]>('get_battery_history', { minutes });
-      if (rows.length > 1) return rows;
-    } catch (e) {
-      console.warn('get_battery_history failed:', e);
-    }
-  }
-  return mock.getHistory(minutes);
+  return safe<HistoryPoint[]>('get_battery_history', [], { minutes });
 }
 
 export async function getBatterySessions(): Promise<BatterySession[]> {
-  if (inTauri()) {
-    try {
-      const rows = await tauriInvoke<BatterySession[]>('get_battery_sessions');
-      if (rows.length > 0) return rows;
-    } catch (e) {
-      console.warn('get_battery_sessions failed:', e);
-    }
-  }
-  return mock.getAllBatterySessions();
+  return safe<BatterySession[]>('get_battery_sessions', []);
 }
 
 export async function getSleepSessions(): Promise<SleepSession[]> {
-  if (inTauri()) {
-    try {
-      const rows = await tauriInvoke<SleepSession[]>('get_sleep_sessions');
-      if (rows.length > 0) return rows;
-    } catch (e) {
-      console.warn('get_sleep_sessions failed:', e);
-    }
-  }
-  return mock.getAllSleepSessions();
+  return safe<SleepSession[]>('get_sleep_sessions', []);
 }
 
 export async function getHealthHistory(): Promise<HealthSnapshot[]> {
-  if (inTauri()) {
-    try {
-      const rows = await tauriInvoke<HealthSnapshot[]>('get_health_history');
-      if (rows.length > 0) return rows;
-    } catch (e) {
-      console.warn('get_health_history failed:', e);
-    }
-  }
-  return mock.getHealthHistory();
+  return safe<HealthSnapshot[]>('get_health_history', []);
 }
 
 export async function getSessionDetail(sessionId: number): Promise<SessionDetail> {
-  if (inTauri()) {
-    try {
-      const detail = await tauriInvoke<SessionDetail>('get_session_detail', { sessionId });
-      if (detail.history.length > 1) return detail;
-    } catch (e) {
-      console.warn('get_session_detail failed:', e);
-    }
-  }
-  // Mock fallback — find the session in the mock list and generate detail.
-  const sessions = mock.getAllBatterySessions();
-  const session = sessions.find((s) => s.id === sessionId) ?? sessions[0];
-  return mock.getBatterySessionDetail(session);
+  return safe('get_session_detail', EMPTY_SESSION_DETAIL, { sessionId });
 }
 
-export async function getSleepDetail(sleepId: number): Promise<SleepDetail> {
-  // Sleep detail is mock-only for now (we don't store per-sleep history
-  // in the prototype DB; only pre/post capacity).
-  const sleeps = mock.getAllSleepSessions();
-  const sleep = sleeps.find((s) => s.id === sleepId) ?? sleeps[0];
-  return mock.getSleepSessionDetail(sleep);
+export async function getSleepDetail(_sleepId: number): Promise<SleepDetail> {
+  // No backend command yet — we only store pre/post capacity for sleeps,
+  // not per-tick history. Return empty until Phase 3 adds it.
+  return EMPTY_SLEEP_DETAIL;
 }
 
 export async function getComponentHistory(minutes: number): Promise<ComponentHistoryPoint[]> {
-  // Real backend has per-channel power_history but the shape is per-channel
-  // arrays, not the stacked-area shape the chart wants. We'd need to bucket
-  // by timestamp and align channels. For now, mock this until we add a
-  // dedicated command. The single-frame Components page (top section) still
-  // uses real data via getPowerReading().
-  return mock.getComponentHistory(minutes);
+  return safe<ComponentHistoryPoint[]>('get_component_history', [], { minutes });
+}
+
+// ─── Unified timeline (Sessions page) ───────────────────────────────────
+
+export interface UnifiedTimeline {
+  history: HistoryPoint[];
+  batterySessions: BatterySession[];
+  sleepSessions: SleepSession[];
+  componentHistory: ComponentHistoryPoint[];
+  appPowerSummary: AppPowerSummary[];
+}
+
+const EMPTY_UNIFIED_TIMELINE: UnifiedTimeline = {
+  history: [],
+  batterySessions: [],
+  sleepSessions: [],
+  componentHistory: [],
+  appPowerSummary: [],
+};
+
+export async function getUnifiedTimeline(startTs: number, endTs: number): Promise<UnifiedTimeline> {
+  return safe('get_unified_timeline', EMPTY_UNIFIED_TIMELINE, { startTs, endTs });
+}
+
+// ─── Accent color ───────────────────────────────────────────────────────
+export async function getAccentColor(): Promise<string | null> {
+  if (!inTauri()) return null;
+  try {
+    return await tauriInvoke<string>('get_accent_color');
+  } catch {
+    return null;
+  }
+}
+
+// ─── Autostart ──────────────────────────────────────────────────────────
+export async function enableAutostart(): Promise<void> {
+  return safe('enable_autostart', undefined);
+}
+
+export async function disableAutostart(): Promise<void> {
+  return safe('disable_autostart', undefined);
+}
+
+export async function isAutostartEnabled(): Promise<boolean> {
+  return safe('is_autostart_enabled', false);
+}
+
+// ─── Notification preferences ───────────────────────────────────────────
+export interface NotificationPrefsInput {
+  notifyCharge: boolean;
+  chargeLimit: number;
+  notifyLow: boolean;
+  lowThreshold: number;
+  notifySleepDrain: boolean;
+  summaryEnabled: boolean;
+  summaryIntervalMin: number;
+  summaryOnlyOnBattery: boolean;
+  summaryShowRate: boolean;
+  summaryShowEta: boolean;
+  summaryShowDelta: boolean;
+  summaryShowTopApp: boolean;
+}
+
+export async function setNotificationPrefs(prefs: NotificationPrefsInput): Promise<void> {
+  return safe('set_notification_prefs', undefined, { prefs });
 }
 
 // Convenience: returns true if we're connected to the real Rust backend.
-// The Settings page can use this to show "demo mode" vs "live".
 export function isLive(): boolean {
   return inTauri();
 }

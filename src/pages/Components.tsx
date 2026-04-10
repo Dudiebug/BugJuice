@@ -1,3 +1,4 @@
+import { Fragment } from 'react';
 import {
   Area,
   AreaChart,
@@ -180,6 +181,43 @@ export function Components() {
             })}
           </div>
         </div>
+      </section>
+
+      {/* ─── Raw channels (diagnostic) ──────────────────────────────── */}
+      <section className="card">
+        <div className="card-header">
+          <div>
+            <div className="card-title">Raw EMI channels</div>
+            <div className="card-subtitle">
+              Exactly what the hardware reports, unmodified · {power.channels.length} channels
+            </div>
+          </div>
+        </div>
+        {power.channels.length === 0 ? (
+          <div className="stat-context" style={{ padding: '12px 0' }}>
+            No channels reported. Either the bugjuice-service isn't running or
+            this device doesn't expose an Energy Meter Interface.
+          </div>
+        ) : (
+          <div
+            style={{
+              display: 'grid',
+              gridTemplateColumns: '1fr 120px',
+              gap: '4px 16px',
+              fontSize: 13,
+              fontVariantNumeric: 'tabular-nums',
+            }}
+          >
+            {power.channels.map((ch) => (
+              <Fragment key={ch.name}>
+                <div style={{ color: 'var(--text-subtle)' }}>{ch.name}</div>
+                <div style={{ textAlign: 'right', color: 'var(--text)' }}>
+                  {ch.watts.toFixed(4)} W
+                </div>
+              </Fragment>
+            ))}
+          </div>
+        )}
       </section>
 
       {/* ─── Stacked area over time ─────────────────────────────────── */}

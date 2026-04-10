@@ -153,6 +153,7 @@ function getPower(): PowerReading {
     gpuW: gpu,
     dramW: 0.1 + Math.random() * 0.2,
     source: 'EMI v2 — Qualcomm 8380 (mock)',
+    channels: [],
   };
 }
 

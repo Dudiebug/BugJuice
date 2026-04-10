@@ -425,6 +425,38 @@ impl Storage {
         Ok(())
     }
 
+    // ── Tiered aggregation ─────────────────────────────────────────────────────
+
+    /// Aggregate raw readings from the given hour into hourly_stats.
+    /// hour_ts should be the start-of-hour Unix timestamp (aligned to 3600).
+    pub fn aggregate_hour(&self, hour_ts: i64) -> rusqlite::Result<usize> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT OR REPLACE INTO hourly_stats (sensor_id, hour_ts, min_val, max_val, avg_val, count_val, sum_val, sum_sq)
+             SELECT sensor_id, ?1, MIN(value), MAX(value), AVG(value), COUNT(*), SUM(value), SUM(value * value)
+             FROM readings
+             WHERE ts >= ?1 AND ts < ?2
+             GROUP BY sensor_id",
+            rusqlite::params![hour_ts, hour_ts + 3600],
+        )
+    }
+
+    /// Aggregate hourly_stats from the given day into daily_stats.
+    /// day_ts should be the start-of-day Unix timestamp (aligned to 86400).
+    pub fn aggregate_day(&self, day_ts: i64) -> rusqlite::Result<usize> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT OR REPLACE INTO daily_stats (sensor_id, day_ts, min_val, max_val, avg_val, count_val, sum_val, sum_sq)
+             SELECT sensor_id, ?1, MIN(min_val), MAX(max_val),
+                    CASE WHEN SUM(count_val) > 0 THEN SUM(sum_val) / SUM(count_val) ELSE 0 END,
+                    SUM(count_val), SUM(sum_val), SUM(sum_sq)
+             FROM hourly_stats
+             WHERE hour_ts >= ?1 AND hour_ts < ?2
+             GROUP BY sensor_id",
+            rusqlite::params![day_ts, day_ts + 86400],
+        )
+    }
+
     // ── Reads for the UI ──────────────────────────────────────────────────────
 
     /// Battery percent + rate readings over the last `seconds` seconds.
@@ -540,6 +572,106 @@ impl Storage {
         )?;
         let v: Vec<SleepSessionRow> = stmt
             .query_map([], |r| {
+                Ok(SleepSessionRow {
+                    id: r.get(0)?,
+                    sleep_at: r.get(1)?,
+                    wake_at: r.get(2)?,
+                    pre_capacity: r.get(3)?,
+                    post_capacity: r.get(4)?,
+                    drain_mwh: r.get(5)?,
+                    drain_percent: r.get(6)?,
+                    drain_rate_mw: r.get(7)?,
+                    drips_percent: r.get(8)?,
+                })
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
+        Ok(v)
+    }
+
+    /// Battery percent + rate readings within an absolute time range.
+    /// Used by the unified timeline on the Sessions page.
+    pub fn read_history_range(&self, start_ts: i64, end_ts: i64) -> SqlResult<Vec<HistoryPointRow>> {
+        let conn = self.conn.lock().unwrap();
+        let pct_rows: Vec<(i64, f64)> = {
+            let mut stmt = conn.prepare(
+                "SELECT r.ts, r.value
+                 FROM readings r JOIN sensors s ON r.sensor_id = s.sensor_id
+                 WHERE s.name = 'battery_percent' AND r.ts >= ? AND r.ts <= ?
+                 ORDER BY r.ts ASC",
+            )?;
+            let mapped = stmt
+                .query_map(params![start_ts, end_ts], |r| Ok((r.get(0)?, r.get(1)?)))?
+                .filter_map(|r| r.ok())
+                .collect::<Vec<(i64, f64)>>();
+            mapped
+        };
+        let rate_rows: std::collections::HashMap<i64, f64> = {
+            let mut stmt = conn.prepare(
+                "SELECT r.ts, r.value
+                 FROM readings r JOIN sensors s ON r.sensor_id = s.sensor_id
+                 WHERE s.name = 'battery_rate' AND r.ts >= ? AND r.ts <= ?
+                 ORDER BY r.ts ASC",
+            )?;
+            let mapped = stmt
+                .query_map(params![start_ts, end_ts], |r| {
+                    Ok((r.get::<_, i64>(0)?, r.get::<_, f64>(1)?))
+                })?
+                .filter_map(|r| r.ok())
+                .collect::<std::collections::HashMap<i64, f64>>();
+            mapped
+        };
+        Ok(pct_rows
+            .into_iter()
+            .map(|(ts, percent)| HistoryPointRow {
+                ts,
+                percent,
+                rate_w: *rate_rows.get(&ts).unwrap_or(&0.0),
+            })
+            .collect())
+    }
+
+    /// Battery sessions overlapping a time range, newest first.
+    pub fn read_battery_sessions_range(&self, start_ts: i64, end_ts: i64) -> SqlResult<Vec<BatterySessionRow>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT session_id, started_at, ended_at, start_percent, end_percent,
+                    start_capacity, end_capacity, avg_drain_watts, on_ac
+             FROM battery_sessions
+             WHERE started_at <= ? AND (ended_at >= ? OR ended_at IS NULL)
+             ORDER BY started_at DESC",
+        )?;
+        let v: Vec<BatterySessionRow> = stmt
+            .query_map(params![end_ts, start_ts], |r| {
+                Ok(BatterySessionRow {
+                    id: r.get(0)?,
+                    started_at: r.get(1)?,
+                    ended_at: r.get(2)?,
+                    start_percent: r.get(3)?,
+                    end_percent: r.get(4)?,
+                    start_capacity: r.get(5)?,
+                    end_capacity: r.get(6)?,
+                    avg_drain_watts: r.get(7)?,
+                    on_ac: r.get::<_, i64>(8)? != 0,
+                })
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
+        Ok(v)
+    }
+
+    /// Sleep sessions overlapping a time range, newest first.
+    pub fn read_sleep_sessions_range(&self, start_ts: i64, end_ts: i64) -> SqlResult<Vec<SleepSessionRow>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, sleep_at, wake_at, pre_capacity, post_capacity,
+                    drain_mwh, drain_percent, drain_rate_mw, drips_percent
+             FROM sleep_sessions
+             WHERE sleep_at <= ? AND (wake_at >= ? OR wake_at IS NULL)
+             ORDER BY sleep_at DESC",
+        )?;
+        let v: Vec<SleepSessionRow> = stmt
+            .query_map(params![end_ts, start_ts], |r| {
                 Ok(SleepSessionRow {
                     id: r.get(0)?,
                     sleep_at: r.get(1)?,
@@ -675,6 +807,67 @@ impl Storage {
             app_power,
         })
     }
+
+    /// Aggregated per-process power stats for a time range. Returns the
+    /// top 20 processes by average wattage.
+    pub fn read_app_power_summary(
+        &self,
+        start_ts: i64,
+        end_ts: i64,
+    ) -> rusqlite::Result<Vec<AppPowerSummaryRow>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT process_name,
+                    AVG(COALESCE(total_watts, 0)) as avg_watts,
+                    MAX(COALESCE(total_watts, 0)) as max_watts,
+                    COUNT(*) as sample_count
+             FROM app_power
+             WHERE ts >= ?1 AND ts < ?2
+             GROUP BY process_name
+             ORDER BY avg_watts DESC
+             LIMIT 20",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![start_ts, end_ts], |row| {
+            Ok(AppPowerSummaryRow {
+                process_name: row.get(0)?,
+                avg_watts: row.get(1)?,
+                max_watts: row.get(2)?,
+                sample_count: row.get(3)?,
+            })
+        })?;
+        rows.collect()
+    }
+
+    /// Per-power-channel readings within an absolute time range. Returns
+    /// (sensor_name, [(ts, watts), …]) for everything in the 'power'
+    /// category. Range-based variant of `read_power_history`.
+    pub fn read_power_history_range(
+        &self,
+        start_ts: i64,
+        end_ts: i64,
+    ) -> SqlResult<Vec<(String, Vec<(i64, f64)>)>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT s.name, r.ts, r.value
+             FROM readings r JOIN sensors s ON r.sensor_id = s.sensor_id
+             WHERE s.category = 'power' AND r.ts >= ? AND r.ts < ?
+             ORDER BY r.ts ASC",
+        )?;
+        let mut grouped: std::collections::HashMap<String, Vec<(i64, f64)>> =
+            std::collections::HashMap::new();
+        for row in stmt.query_map(params![start_ts, end_ts], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, i64>(1)?,
+                r.get::<_, f64>(2)?,
+            ))
+        })? {
+            if let Ok((name, ts, val)) = row {
+                grouped.entry(name).or_default().push((ts, val));
+            }
+        }
+        Ok(grouped.into_iter().collect())
+    }
 }
 
 pub struct RowCounts {
@@ -759,6 +952,14 @@ pub struct HealthSnapshotRow {
     pub wear_percent: Option<f64>,
     pub voltage_mv: Option<i64>,
     pub temperature_c: Option<f64>,
+}
+
+#[derive(Debug, Clone)]
+pub struct AppPowerSummaryRow {
+    pub process_name: String,
+    pub avg_watts: f64,
+    pub max_watts: f64,
+    pub sample_count: i64,
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────

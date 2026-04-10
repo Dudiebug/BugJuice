@@ -5,7 +5,8 @@
 // All DTO types use #[serde(rename_all = "camelCase")] so they line up
 // with the TypeScript interfaces in src/types.ts.
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
+use std::sync::{Mutex as StdMutex, OnceLock};
 
 use crate::battery::{
     self, BATTERY_CHARGING, BATTERY_CRITICAL, BATTERY_DISCHARGING, BATTERY_POWER_ON_LINE,
@@ -163,6 +164,13 @@ pub fn get_battery_status() -> Result<BatteryStatusDto, String> {
 
 #[derive(Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
+pub struct PowerChannelDto {
+    pub name: String,
+    pub watts: f64,
+}
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
 pub struct PowerReadingDto {
     pub wall_input_w: Option<f64>,
     pub system_draw_w: Option<f64>,
@@ -170,23 +178,37 @@ pub struct PowerReadingDto {
     pub gpu_w: Option<f64>,
     pub dram_w: Option<f64>,
     pub source: String,
+    /// Raw per-channel values as reported by EMI, for diagnostics.
+    pub channels: Vec<PowerChannelDto>,
 }
 
 #[tauri::command]
 pub fn get_power_reading() -> Result<PowerReadingDto, String> {
-    let readings = power::read_all_emi(std::time::Duration::from_millis(200))
-        .unwrap_or_default();
-    if readings.is_empty() {
-        return Ok(PowerReadingDto {
+    // Read the EMI counters directly — same code path the CLI uses and
+    // proves works on Snapdragon X without elevation. Use a 1-second
+    // window; the Qualcomm EMI driver sometimes returns identical counter
+    // values for sub-second deltas.
+    match power::read_all_emi(std::time::Duration::from_secs(1)) {
+        Ok(readings) if !readings.is_empty() => Ok(power_dto_from_emi(&readings[0])),
+        Ok(_) => Ok(PowerReadingDto {
             wall_input_w: None,
             system_draw_w: None,
             cpu_package_w: None,
             gpu_w: None,
             dram_w: None,
-            source: "no EMI device".to_string(),
-        });
+            source: "EMI: enumeration returned 0 devices".to_string(),
+            channels: vec![],
+        }),
+        Err(e) => Ok(PowerReadingDto {
+            wall_input_w: None,
+            system_draw_w: None,
+            cpu_package_w: None,
+            gpu_w: None,
+            dram_w: None,
+            source: format!("EMI error: {e}"),
+            channels: vec![],
+        }),
     }
-    Ok(power_dto_from_emi(&readings[0]))
 }
 
 fn power_dto_from_emi(r: &EmiReading) -> PowerReadingDto {
@@ -249,6 +271,15 @@ fn power_dto_from_emi(r: &EmiReading) -> PowerReadingDto {
         r.model
     );
 
+    let channels = r
+        .channels
+        .iter()
+        .map(|c| PowerChannelDto {
+            name: c.name.clone(),
+            watts: c.watts,
+        })
+        .collect();
+
     PowerReadingDto {
         wall_input_w: input_total,
         system_draw_w: sys_total,
@@ -256,6 +287,7 @@ fn power_dto_from_emi(r: &EmiReading) -> PowerReadingDto {
         gpu_w: gpu_total,
         dram_w: dram_total,
         source,
+        channels,
     }
 }
 
@@ -273,13 +305,22 @@ pub struct AppPowerDto {
     pub total_w: f64,
 }
 
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct TopAppsResponse {
+    pub apps: Vec<AppPowerDto>,
+    pub confidence_percent: f64,
+    pub battery_discharge_w: f64,
+}
+
 #[tauri::command]
-pub fn get_top_apps() -> Result<Vec<AppPowerDto>, String> {
+pub fn get_top_apps() -> Result<TopAppsResponse, String> {
     let storage = storage::global().ok_or_else(|| "storage not initialized".to_string())?;
     let rows = storage
         .read_recent_app_power()
         .map_err(|e| format!("read app_power: {e}"))?;
-    Ok(rows
+
+    let apps: Vec<AppPowerDto> = rows
         .into_iter()
         .map(|r| AppPowerDto {
             pid: 0,
@@ -290,7 +331,23 @@ pub fn get_top_apps() -> Result<Vec<AppPowerDto>, String> {
             net_w: 0.0,
             total_w: r.total_watts,
         })
-        .collect())
+        .collect();
+
+    let total_attributed: f64 = apps.iter().map(|a| a.total_w).sum();
+
+    // Get latest battery discharge rate for confidence calculation
+    let battery_w = crate::polling::last_battery_rate_w();
+    let confidence = if battery_w.abs() > 0.5 {
+        (total_attributed / battery_w.abs() * 100.0).clamp(0.0, 100.0)
+    } else {
+        0.0
+    };
+
+    Ok(TopAppsResponse {
+        apps,
+        confidence_percent: confidence,
+        battery_discharge_w: battery_w,
+    })
 }
 
 // ─── History ─────────────────────────────────────────────────────────────────
@@ -441,6 +498,77 @@ pub fn get_health_history() -> Result<Vec<HealthSnapshotDto>, String> {
         .collect())
 }
 
+// ─── Component power history (for the Components page stacked chart) ──────
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct ComponentHistoryPointDto {
+    pub ts: i64,
+    pub cpu: f64,
+    pub gpu: f64,
+    pub dram: f64,
+    pub other: f64,
+}
+
+fn categorize_channel(name: &str) -> &'static str {
+    let n = name.to_ascii_uppercase();
+    if n.contains("PP1") || n.contains("GPU") {
+        "gpu"
+    } else if n.contains("DRAM") {
+        "dram"
+    } else if n.contains("PKG") || n.contains("PP0") || n.contains("CPU") {
+        "cpu"
+    } else if n == "SYS" || n.contains("SOC") || n.contains("PLATFORM") || n.contains("PSYS") {
+        // Treat whole-system channels as "other" for the stacked chart.
+        // The chart is a component breakdown, not a total.
+        "other"
+    } else if n.contains("PSU") || n.contains("USBC") {
+        // Wall input — exclude from the component stack.
+        "skip"
+    } else {
+        "other"
+    }
+}
+
+#[tauri::command]
+pub fn get_component_history(minutes: i64) -> Result<Vec<ComponentHistoryPointDto>, String> {
+    let storage = storage::global().ok_or_else(|| "storage not initialized".to_string())?;
+    let grouped = storage
+        .read_power_history(minutes * 60)
+        .map_err(|e| format!("read power history: {e}"))?;
+
+    // Bucket per-second, categorize per channel, then sum within each
+    // category. The chart wants { ts, cpu, gpu, dram, other } rows.
+    use std::collections::BTreeMap;
+    let mut buckets: BTreeMap<i64, (f64, f64, f64, f64)> = BTreeMap::new();
+    for (name, samples) in grouped {
+        let cat = categorize_channel(&name);
+        if cat == "skip" {
+            continue;
+        }
+        for (ts, watts) in samples {
+            let slot = buckets.entry(ts).or_insert((0.0, 0.0, 0.0, 0.0));
+            match cat {
+                "cpu" => slot.0 += watts,
+                "gpu" => slot.1 += watts,
+                "dram" => slot.2 += watts,
+                _ => slot.3 += watts,
+            }
+        }
+    }
+
+    Ok(buckets
+        .into_iter()
+        .map(|(ts, (cpu, gpu, dram, other))| ComponentHistoryPointDto {
+            ts,
+            cpu,
+            gpu,
+            dram,
+            other,
+        })
+        .collect())
+}
+
 // ─── Session detail (drill-down for the Sessions page) ─────────────────────
 
 #[derive(Serialize, Clone)]
@@ -505,6 +633,135 @@ pub fn get_session_detail(session_id: i64) -> Result<SessionDetailDto, String> {
     })
 }
 
+// ─── App power summary ──────────────────────────────────────────────────────
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct AppPowerSummaryDto {
+    pub name: String,
+    pub avg_watts: f64,
+    pub max_watts: f64,
+    pub sample_count: i64,
+}
+
+// ─── Unified timeline (Sessions page) ─────────────────────────────────────────
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct UnifiedTimelineDto {
+    pub history: Vec<HistoryPointDto>,
+    pub battery_sessions: Vec<BatterySessionDto>,
+    pub sleep_sessions: Vec<SleepSessionDto>,
+    pub component_history: Vec<ComponentHistoryPointDto>,
+    pub app_power_summary: Vec<AppPowerSummaryDto>,
+}
+
+#[tauri::command]
+pub fn get_unified_timeline(start_ts: i64, end_ts: i64) -> Result<UnifiedTimelineDto, String> {
+    let storage = storage::global().ok_or_else(|| "storage not initialized".to_string())?;
+
+    let history = storage
+        .read_history_range(start_ts, end_ts)
+        .map_err(|e| format!("read history range: {e}"))?
+        .into_iter()
+        .map(|r| HistoryPointDto {
+            ts: r.ts,
+            percent: r.percent,
+            rate_w: r.rate_w,
+        })
+        .collect();
+
+    let battery_sessions = storage
+        .read_battery_sessions_range(start_ts, end_ts)
+        .map_err(|e| format!("read battery sessions range: {e}"))?
+        .into_iter()
+        .map(|r| BatterySessionDto {
+            id: r.id,
+            started_at: r.started_at,
+            ended_at: r.ended_at,
+            start_percent: r.start_percent.unwrap_or(0.0),
+            end_percent: r.end_percent,
+            start_capacity: r.start_capacity.unwrap_or(0),
+            end_capacity: r.end_capacity,
+            avg_drain_w: r.avg_drain_watts,
+            on_ac: r.on_ac,
+        })
+        .collect();
+
+    let sleep_sessions = storage
+        .read_sleep_sessions_range(start_ts, end_ts)
+        .map_err(|e| format!("read sleep sessions range: {e}"))?
+        .into_iter()
+        .map(|r| SleepSessionDto {
+            id: r.id,
+            sleep_at: r.sleep_at,
+            wake_at: r.wake_at,
+            pre_capacity: r.pre_capacity.unwrap_or(0),
+            post_capacity: r.post_capacity,
+            drain_mwh: r.drain_mwh,
+            drain_percent: r.drain_percent,
+            drain_rate_mw: r.drain_rate_mw,
+            drips_percent: r.drips_percent,
+            verdict: classify_verdict(r.drain_rate_mw),
+        })
+        .collect();
+
+    // Component power history — same categorization logic as get_component_history
+    let component_history = {
+        let grouped = storage
+            .read_power_history_range(start_ts, end_ts)
+            .map_err(|e| format!("read power history range: {e}"))?;
+        use std::collections::BTreeMap;
+        let mut buckets: BTreeMap<i64, (f64, f64, f64, f64)> = BTreeMap::new();
+        for (name, samples) in grouped {
+            let cat = categorize_channel(&name);
+            if cat == "skip" {
+                continue;
+            }
+            for (ts, watts) in samples {
+                let slot = buckets.entry(ts).or_insert((0.0, 0.0, 0.0, 0.0));
+                match cat {
+                    "cpu" => slot.0 += watts,
+                    "gpu" => slot.1 += watts,
+                    "dram" => slot.2 += watts,
+                    _ => slot.3 += watts,
+                }
+            }
+        }
+        buckets
+            .into_iter()
+            .map(|(ts, (cpu, gpu, dram, other))| ComponentHistoryPointDto {
+                ts,
+                cpu,
+                gpu,
+                dram,
+                other,
+            })
+            .collect()
+    };
+
+    // App power summary — top processes by average wattage in the range
+    let app_power_summary = storage
+        .read_app_power_summary(start_ts, end_ts)
+        .map_err(|e| format!("read app power summary: {e}"))?
+        .into_iter()
+        .map(|r| AppPowerSummaryDto {
+            name: r.process_name,
+            avg_watts: r.avg_watts,
+            max_watts: r.max_watts,
+            sample_count: r.sample_count,
+        })
+        .collect();
+
+    Ok(UnifiedTimelineDto {
+        history,
+        battery_sessions,
+        sleep_sessions,
+        component_history,
+        app_power_summary,
+    })
+}
+
 // ─── DB stats (for a debug page or footer) ─────────────────────────────────
 
 #[derive(Serialize, Clone)]
@@ -532,4 +789,120 @@ pub fn get_db_stats() -> Result<DbStatsDto, String> {
         sensors: rc.sensors,
         app_power: rc.app_power,
     })
+}
+
+// ─── Accent color ──────────────────────────────────────────────────────────
+
+#[tauri::command]
+pub fn get_accent_color() -> Result<String, String> {
+    use windows::Win32::System::Registry::{
+        RegOpenKeyExW, RegQueryValueExW, HKEY_CURRENT_USER, KEY_READ, REG_DWORD,
+    };
+    use windows::core::w;
+
+    unsafe {
+        let mut hkey = Default::default();
+        let err = RegOpenKeyExW(
+            HKEY_CURRENT_USER,
+            w!("Software\\Microsoft\\Windows\\DWM"),
+            None,
+            KEY_READ,
+            &mut hkey,
+        );
+        if err.0 != 0 {
+            return Err(format!("RegOpenKeyExW failed: {}", err.0));
+        }
+
+        let mut data = [0u8; 4];
+        let mut data_size = 4u32;
+        let mut data_type = REG_DWORD;
+        let err = RegQueryValueExW(
+            hkey,
+            w!("AccentColor"),
+            None,
+            Some(&mut data_type),
+            Some(data.as_mut_ptr()),
+            Some(&mut data_size),
+        );
+        if err.0 != 0 {
+            return Err(format!("RegQueryValueExW failed: {}", err.0));
+        }
+
+        // AccentColor is stored as 0xAABBGGRR (alpha, blue, green, red)
+        let r = data[0];
+        let g = data[1];
+        let b = data[2];
+        Ok(format!("#{r:02x}{g:02x}{b:02x}"))
+    }
+}
+
+// ─── Notification preferences ──────────────────────────────────────────────
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NotificationPrefs {
+    pub notify_charge: bool,
+    pub charge_limit: f64,
+    pub notify_low: bool,
+    pub low_threshold: f64,
+    pub notify_sleep_drain: bool,
+    // Periodic summary
+    pub summary_enabled: bool,
+    pub summary_interval_min: u32,
+    pub summary_only_on_battery: bool,
+    pub summary_show_rate: bool,
+    pub summary_show_eta: bool,
+    pub summary_show_delta: bool,
+    pub summary_show_top_app: bool,
+}
+
+impl Default for NotificationPrefs {
+    fn default() -> Self {
+        Self {
+            notify_charge: true,
+            charge_limit: 80.0,
+            notify_low: true,
+            low_threshold: 20.0,
+            notify_sleep_drain: true,
+            summary_enabled: true,
+            summary_interval_min: 15,
+            summary_only_on_battery: false,
+            summary_show_rate: true,
+            summary_show_eta: true,
+            summary_show_delta: true,
+            summary_show_top_app: true,
+        }
+    }
+}
+
+static NOTIFICATION_PREFS: OnceLock<StdMutex<NotificationPrefs>> = OnceLock::new();
+
+pub fn notification_prefs() -> &'static StdMutex<NotificationPrefs> {
+    NOTIFICATION_PREFS.get_or_init(|| StdMutex::new(NotificationPrefs::default()))
+}
+
+#[tauri::command]
+pub fn set_notification_prefs(prefs: NotificationPrefs) -> Result<(), String> {
+    *notification_prefs().lock().unwrap() = prefs;
+    Ok(())
+}
+
+// ─── Autostart ─────────────────────────────────────────────────────────────
+
+#[tauri::command]
+pub async fn enable_autostart(app: tauri::AppHandle) -> Result<(), String> {
+    use tauri_plugin_autostart::ManagerExt;
+    app.autolaunch().enable().map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn disable_autostart(app: tauri::AppHandle) -> Result<(), String> {
+    use tauri_plugin_autostart::ManagerExt;
+    app.autolaunch().disable().map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn is_autostart_enabled(app: tauri::AppHandle) -> Result<bool, String> {
+    use tauri_plugin_autostart::ManagerExt;
+    app.autolaunch().is_enabled().map_err(|e| e.to_string())
 }

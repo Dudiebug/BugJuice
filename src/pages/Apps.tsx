@@ -5,13 +5,13 @@ import { useApi } from '@/hooks/useApi';
 type SortKey = 'total' | 'cpu' | 'gpu' | 'name';
 
 export function Apps() {
-  const appsData = useApi(getTopApps, 2000);
-  // Make sure each row has the optional decoration fields the page uses.
-  // Real backend rows don't have iconHint / hog yet, so we derive them.
-  const apps = (appsData ?? []).map((a) => ({
+  const response = useApi(getTopApps, 2000);
+  const rawApps = response?.apps ?? [];
+  const totalW = rawApps.reduce((acc, a) => acc + a.totalW, 0);
+  const apps = rawApps.map((a) => ({
     ...a,
     iconHint: a.name.charAt(0).toUpperCase(),
-    hog: a.totalW > 3,
+    hog: (totalW > 0 && a.totalW / totalW > 0.30) || a.totalW > 3,
   }));
 
   const [query, setQuery] = useState('');
@@ -37,9 +37,7 @@ export function Apps() {
     return list;
   }, [apps, query, sortKey]);
 
-  const totalW = apps.reduce((acc, a) => acc + a.totalW, 0);
-  const accounted = filtered.slice(0, 15).reduce((acc, a) => acc + a.totalW, 0);
-  const confidence = totalW > 0 ? (accounted / totalW) * 100 : 0;
+  const confidence = response?.confidencePercent ?? 0;
   const hogs = apps.filter((a) => a.hog).length;
 
   return (
@@ -162,7 +160,9 @@ export function Apps() {
                 color: 'var(--text-muted)',
               }}
             >
-              No processes match "{query}"
+              {query
+                ? `No processes match "${query}"`
+                : 'Collecting per-process power data… (first attribution pass can take a few seconds)'}
             </div>
           )}
         </div>

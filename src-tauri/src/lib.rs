@@ -13,7 +13,23 @@ mod processes;
 mod storage;
 
 use std::path::PathBuf;
-use tauri::Manager;
+use std::sync::OnceLock;
+use tauri::{Emitter, Manager};
+
+/// Global AppHandle so the polling thread and event callbacks can access
+/// Tauri APIs (tray tooltip, notifications) without plumbing through args.
+static APP_HANDLE: OnceLock<tauri::AppHandle> = OnceLock::new();
+
+pub fn app_handle() -> Option<&'static tauri::AppHandle> {
+    APP_HANDLE.get()
+}
+
+/// Global tray menu so the polling thread can update the info items.
+static TRAY_MENU: OnceLock<tauri::menu::Menu<tauri::Wry>> = OnceLock::new();
+
+pub fn tray_menu() -> Option<&'static tauri::menu::Menu<tauri::Wry>> {
+    TRAY_MENU.get()
+}
 
 /// Apply EcoQoS execution-speed throttling to ourselves.
 fn enable_ecoqos() {
@@ -57,7 +73,16 @@ pub(crate) fn format_hours(h: f64) -> String {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_notification::init())
+        .plugin(tauri_plugin_autostart::init(
+            tauri_plugin_autostart::MacosLauncher::LaunchAgent,
+            Some(vec!["--minimized"]),
+        ))
         .setup(|app| {
+            // Store the AppHandle globally so the polling thread and event
+            // callbacks can access tray icon and notification APIs.
+            APP_HANDLE.set(app.handle().clone()).ok();
+
             // Database lives in the per-user app data dir, e.g.
             //   C:\Users\<user>\AppData\Roaming\com.dudiebug.bugjuice\bugjuice.db
             let db_path: PathBuf = app
@@ -78,7 +103,7 @@ pub fn run() {
             enable_ecoqos();
 
             // Spawn the background polling thread (battery + EMI + per-app
-            // attribution → SQLite every adaptive interval).
+            // attribution -> SQLite every adaptive interval).
             polling::spawn();
 
             // Register power-event callbacks (sleep/wake, AC/DC, 1% changes,
@@ -90,6 +115,73 @@ pub fn run() {
                 Err(e) => log::warn!("power event registration failed: {e}"),
             }
 
+            // ── System tray ─────────────────────────────────────────────
+            use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
+            use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
+
+            let info_state =
+                MenuItem::with_id(app, "info_state", "Checking battery\u{2026}", false, None::<&str>)?;
+            let info_eta =
+                MenuItem::with_id(app, "info_eta", "", false, None::<&str>)?;
+            let sep1 = PredefinedMenuItem::separator(app)?;
+            let show_item = MenuItem::with_id(app, "show", "Show BugJuice", true, None::<&str>)?;
+            let settings_item =
+                MenuItem::with_id(app, "settings", "Settings", true, None::<&str>)?;
+            let separator = PredefinedMenuItem::separator(app)?;
+            let quit_item = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
+            let menu = Menu::with_items(
+                app,
+                &[
+                    &info_state,
+                    &info_eta,
+                    &sep1,
+                    &show_item,
+                    &settings_item,
+                    &separator,
+                    &quit_item,
+                ],
+            )?;
+
+            TRAY_MENU.set(menu.clone()).ok();
+
+            let _tray = TrayIconBuilder::with_id("main")
+                .icon(app.default_window_icon().unwrap().clone())
+                .menu(&menu)
+                .tooltip("BugJuice")
+                .on_menu_event(|app, event| match event.id.as_ref() {
+                    "show" => {
+                        if let Some(w) = app.get_webview_window("main") {
+                            let _ = w.show();
+                            let _ = w.set_focus();
+                        }
+                    }
+                    "settings" => {
+                        if let Some(w) = app.get_webview_window("main") {
+                            let _ = w.show();
+                            let _ = w.set_focus();
+                            let _ = w.emit("navigate", "/settings");
+                        }
+                    }
+                    "quit" => {
+                        app.exit(0);
+                    }
+                    _ => {}
+                })
+                .on_tray_icon_event(|tray, event| {
+                    if let TrayIconEvent::Click {
+                        button: MouseButton::Left,
+                        button_state: MouseButtonState::Up,
+                        ..
+                    } = event
+                    {
+                        if let Some(w) = tray.app_handle().get_webview_window("main") {
+                            let _ = w.show();
+                            let _ = w.set_focus();
+                        }
+                    }
+                })
+                .build(app)?;
+
             if cfg!(debug_assertions) {
                 app.handle().plugin(
                     tauri_plugin_log::Builder::default()
@@ -99,16 +191,32 @@ pub fn run() {
             }
             Ok(())
         })
+        .on_window_event(|window, event| {
+            // Hide the window to tray instead of quitting when the user
+            // clicks the X button. The "Quit" menu item in the tray calls
+            // app.exit(0) to actually terminate.
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                let _ = window.hide();
+                api.prevent_close();
+            }
+        })
         .invoke_handler(tauri::generate_handler![
             commands::get_battery_status,
             commands::get_power_reading,
             commands::get_top_apps,
             commands::get_battery_history,
+            commands::get_component_history,
             commands::get_battery_sessions,
             commands::get_sleep_sessions,
             commands::get_health_history,
             commands::get_session_detail,
+            commands::get_unified_timeline,
             commands::get_db_stats,
+            commands::get_accent_color,
+            commands::set_notification_prefs,
+            commands::enable_autostart,
+            commands::disable_autostart,
+            commands::is_autostart_enabled,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

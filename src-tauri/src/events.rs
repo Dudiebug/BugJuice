@@ -210,6 +210,20 @@ fn measure_sleep_drain(baseline_mwh: u32, at: SystemTime, sleep_row_id: Option<i
         (Some(drain_mwh), Some(rate_mw), Some(pct))
     };
 
+    // Notify user if sleep drain is abnormally high
+    if let Some(rate) = rate_mw_opt {
+        let prefs = crate::commands::notification_prefs().lock().unwrap().clone();
+        if prefs.notify_sleep_drain && rate > 200.0 {
+            crate::polling::fire_notification(
+                "Abnormal Sleep Drain",
+                &format!(
+                    "Your laptop lost {} mWh ({:.1}%) while sleeping. Average drain: {:.0} mW.",
+                    drain_print.unwrap_or(0), pct_opt.unwrap_or(0.0), rate
+                ),
+            );
+        }
+    }
+
     if let (Some(id), Some(storage)) = (sleep_row_id, crate::storage::global()) {
         let _ = storage.finish_sleep_session(
             id,

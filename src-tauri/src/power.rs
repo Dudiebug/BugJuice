@@ -126,17 +126,29 @@ pub struct EmiReading {
 /// Read all EMI devices over `delay` seconds (counters need a time window
 /// to compute power from energy deltas). Returns one EmiReading per device.
 pub fn read_all_emi(delay: Duration) -> Result<Vec<EmiReading>, String> {
-    let paths = enumerate_emi_devices()?;
+    let paths = enumerate_emi_devices()
+        .map_err(|e| format!("enumerate_emi_devices: {e}"))?;
     if paths.is_empty() {
-        return Err("no EMI devices present".into());
+        return Err("no EMI devices present (SetupDi enumeration returned 0)".into());
     }
 
     let mut results = Vec::new();
+    let mut device_errors: Vec<String> = Vec::new();
     for (i, path) in paths.iter().enumerate() {
         match read_one_device(path, delay) {
             Ok(r) => results.push(r),
-            Err(e) => eprintln!("  EMI device #{i}: {e}"),
+            Err(e) => {
+                eprintln!("  EMI device #{i}: {e}");
+                device_errors.push(format!("dev{i}: {e}"));
+            }
         }
+    }
+    if results.is_empty() && !device_errors.is_empty() {
+        return Err(format!(
+            "found {} device(s) but all reads failed — {}",
+            paths.len(),
+            device_errors.join(" | ")
+        ));
     }
     Ok(results)
 }
