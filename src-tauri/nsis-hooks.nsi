@@ -4,6 +4,12 @@
 ; The service handles privileged EMI reads; the app connects via named pipe.
 
 !macro NSIS_HOOK_POSTINSTALL
+  ; Strip Mark-of-the-Web (Zone.Identifier) from binaries so Windows
+  ; Defender / SmartScreen doesn't block unsigned executables extracted
+  ; from a downloaded installer.
+  nsExec::ExecToLog 'powershell -NoProfile -Command "Get-ChildItem ''$INSTDIR\*.exe'' | Unblock-File"'
+  Pop $0
+
   ; Install and start the BugJuice power monitoring service
   nsExec::ExecToLog '"$INSTDIR\bugjuice-svc.exe" install'
   Pop $0
