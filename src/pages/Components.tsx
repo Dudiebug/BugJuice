@@ -156,6 +156,8 @@ export function Components() {
                 </Pie>
                 <Tooltip
                   contentStyle={tooltipStyle}
+                  itemStyle={tooltipItemStyle}
+                  labelStyle={tooltipLabelStyle}
                   formatter={(v: number) => `${v.toFixed(2)} W`}
                 />
                 <Legend
@@ -295,6 +297,8 @@ export function Components() {
               />
               <Tooltip
                 contentStyle={tooltipStyle}
+                itemStyle={tooltipItemStyle}
+                labelStyle={tooltipLabelStyle}
                 labelFormatter={(ts: number) =>
                   new Date(ts * 1000).toLocaleTimeString()
                 }
@@ -375,3 +379,6 @@ const tooltipStyle = {
   color: 'var(--text)',
   boxShadow: 'var(--shadow)',
 };
+
+const tooltipItemStyle = { color: 'var(--text)' };
+const tooltipLabelStyle = { color: 'var(--text-muted)' };

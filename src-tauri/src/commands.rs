@@ -1322,7 +1322,7 @@ pub async fn export_report_json(app: tauri::AppHandle) -> Result<String, String>
 
     let report = BugJuiceReport {
         exported_at: chrono_now(),
-        version: "0.4.0-beta".to_string(),
+        version: "1.0.0".to_string(),
         battery_status: status_dto,
         health_history: health,
         charge_habits: habits,

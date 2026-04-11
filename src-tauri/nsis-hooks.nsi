@@ -9,11 +9,15 @@
   Pop $0
   DetailPrint "Service install exit code: $0"
 
-  ; On x64 builds, offer to open the LibreHardwareMonitor download page.
+  ; On x64 (Intel/AMD) only, offer to install LibreHardwareMonitor.
   ; LHM provides enhanced power monitoring (per-core RAPL, AMD GPU power)
-  ; via its signed PawnIO driver. ARM64 builds don't need this — EMI
-  ; already provides rich power channels on Snapdragon X.
-  ${If} ${RunningX64}
+  ; via its signed PawnIO driver. ARM64 builds skip this — EMI already
+  ; provides rich power channels on Snapdragon X.
+  ;
+  ; Check PROCESSOR_ARCHITECTURE to distinguish real x64 from ARM64
+  ; (${RunningX64} can be true on ARM64 under emulation).
+  ReadEnvStr $1 PROCESSOR_ARCHITECTURE
+  ${If} $1 == "AMD64"
     MessageBox MB_YESNO|MB_ICONQUESTION \
       "For enhanced power monitoring, BugJuice recommends installing$\n\
        LibreHardwareMonitor (free, open source).$\n$\n\
