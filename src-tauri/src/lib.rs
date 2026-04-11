@@ -8,6 +8,7 @@ mod commands;
 mod events;
 mod gpu;
 mod lhm;
+mod lhm_setup;
 mod pipe_client;
 mod polling;
 mod power;
@@ -283,6 +284,11 @@ pub fn run() {
             commands::get_power_plan_status,
             commands::set_power_plan_config,
             commands::set_data_retention,
+            lhm_setup::get_lhm_status,
+            lhm_setup::lhm_download,
+            lhm_setup::lhm_find_download,
+            lhm_setup::lhm_install,
+            lhm_setup::lhm_verify,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

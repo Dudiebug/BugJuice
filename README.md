@@ -43,7 +43,7 @@ Download the latest installer from [GitHub Releases](https://github.com/Dudiebug
 
 The installer registers a small Windows service (`bugjuice-svc`) that reads privileged power sensors. One UAC prompt at install, never again. The main app runs as a normal user.
 
-**Optional (x64 only):** Install [LibreHardwareMonitor](https://github.com/LibreHardwareMonitor/LibreHardwareMonitor) for enhanced power monitoring — per-core CPU power, AMD GPU power, and additional sensors. BugJuice automatically detects LHM and surfaces extra data when available.
+**Optional (x64 only):** Install [LibreHardwareMonitor](https://github.com/LibreHardwareMonitor/LibreHardwareMonitor) for enhanced power monitoring — per-core CPU power, AMD GPU power, and additional sensors. BugJuice automatically detects LHM and surfaces extra data when available. ARM64 doesn't require LHM because Snapdragon X exposes all power metrics (CPU, GPU, modem, NPU) directly via the same EMI interface that x64 uses for RAPL.
 
 ## How It Works
 

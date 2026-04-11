@@ -1,6 +1,6 @@
-import { useEffect, useState } from 'react';
-import { enableAutostart, disableAutostart, isAutostartEnabled, setStartMinimized, getStartMinimized, setNotificationPrefs, setDataRetention, exportReportJson, exportReportPdf, getPowerPlanStatus, setPowerPlanConfig } from '@/api';
-import type { PowerPlanStatus } from '@/api';
+import { useEffect, useState, useCallback } from 'react';
+import { enableAutostart, disableAutostart, isAutostartEnabled, setStartMinimized, getStartMinimized, setNotificationPrefs, setDataRetention, exportReportJson, exportReportPdf, getPowerPlanStatus, setPowerPlanConfig, getLhmStatus, lhmDownload, lhmFindDownload, lhmInstall, lhmVerify } from '@/api';
+import type { PowerPlanStatus, LhmStatus } from '@/api';
 
 // Static example data for the notification preview. This is a design
 // preview only — the real notification in the tray uses live data.
@@ -58,6 +58,8 @@ const DEFAULTS: Prefs = {
   dataRetentionDays: 30,
 };
 
+type LhmStep = 'idle' | 'downloading' | 'download-failed' | 'finding' | 'extracting' | 'launching' | 'verifying' | 'done' | 'error';
+
 function loadPrefs(): Prefs {
   try {
     const raw = localStorage.getItem('bugjuice-prefs');
@@ -80,12 +82,23 @@ export function Settings() {
     activeScheme: 'unknown',
   });
 
-  // Load real autostart + start-minimized + power plan state from backend on mount
+  // ── LHM setup state ─────────────────────────────────────────────
+  const [lhm, setLhm] = useState<LhmStatus | null>(null);
+  const [lhmStep, setLhmStep] = useState<LhmStep>('idle');
+  const [lhmError, setLhmError] = useState<string | null>(null);
+  const [lhmFoundZip, setLhmFoundZip] = useState<string | null>(null);
+
+  const refreshLhm = useCallback(() => {
+    getLhmStatus().then(setLhm).catch(() => {});
+  }, []);
+
+  // Load real autostart + start-minimized + power plan + LHM state from backend on mount
   useEffect(() => {
     isAutostartEnabled().then(setAutostartReal).catch(() => {});
     getStartMinimized().then(setMinimizedReal).catch(() => {});
     getPowerPlanStatus().then(setPowerPlan).catch(() => {});
-  }, []);
+    refreshLhm();
+  }, [refreshLhm]);
 
   useEffect(() => {
     localStorage.setItem('bugjuice-prefs', JSON.stringify(prefs));
@@ -239,6 +252,115 @@ export function Settings() {
           </div>
         </SettingRow>
       </section>
+
+      {/* ─── LibreHardwareMonitor (x64 only) ────────────────────────── */}
+      {lhm && lhm.needed && <LhmSetupSection
+        lhm={lhm}
+        step={lhmStep}
+        error={lhmError}
+        foundZip={lhmFoundZip}
+        onSetup={async () => {
+          setLhmStep('downloading');
+          setLhmError(null);
+          const dl = await lhmDownload();
+          if (!dl.success) {
+            setLhmStep('download-failed');
+            setLhmError(dl.error);
+            return;
+          }
+          setLhmStep('extracting');
+          const inst = await lhmInstall();
+          if (!inst.success) {
+            setLhmStep('error');
+            setLhmError(inst.error);
+            return;
+          }
+          setLhmStep('verifying');
+          // Retry verification up to 3 times with 2s gaps.
+          for (let i = 0; i < 3; i++) {
+            await new Promise((r) => setTimeout(r, 2000));
+            if (await lhmVerify()) {
+              setLhmStep('done');
+              refreshLhm();
+              return;
+            }
+          }
+          // LHM launched but WMI not responding yet — that's OK, it'll catch up.
+          setLhmStep('done');
+          refreshLhm();
+        }}
+        onFindZip={async () => {
+          setLhmStep('finding');
+          const found = await lhmFindDownload();
+          if (found) {
+            setLhmFoundZip(found);
+            setLhmStep('extracting');
+            const inst = await lhmInstall(found);
+            if (!inst.success) {
+              setLhmStep('error');
+              setLhmError(inst.error);
+              return;
+            }
+            setLhmStep('verifying');
+            for (let i = 0; i < 3; i++) {
+              await new Promise((r) => setTimeout(r, 2000));
+              if (await lhmVerify()) {
+                setLhmStep('done');
+                refreshLhm();
+                return;
+              }
+            }
+            setLhmStep('done');
+            refreshLhm();
+          } else {
+            setLhmStep('download-failed');
+            setLhmError('No LibreHardwareMonitor zip found in your Downloads folder. Download it and try again.');
+          }
+        }}
+        onOpenDownloadPage={() => {
+          window.open('https://github.com/LibreHardwareMonitor/LibreHardwareMonitor/releases/latest', '_blank');
+        }}
+      />}
+
+      {lhm && !lhm.needed && lhm.running && <section className="card">
+        <div className="card-header">
+          <div>
+            <div className="card-title">LibreHardwareMonitor</div>
+            <div className="card-subtitle">Enhanced power monitoring is active</div>
+          </div>
+          <span className="badge badge-ok">active</span>
+        </div>
+      </section>}
+
+      {lhm && !lhm.needed && lhm.installed && !lhm.running && <section className="card">
+        <div className="card-header">
+          <div>
+            <div className="card-title">LibreHardwareMonitor</div>
+            <div className="card-subtitle">Installed but not running — CPU/GPU power unavailable</div>
+          </div>
+          <span className="badge badge-warn">stopped</span>
+        </div>
+        <SettingRow label="Launch LibreHardwareMonitor" help="Requires admin permission (UAC prompt)">
+          <button
+            onClick={async () => {
+              await lhmInstall();
+              setTimeout(refreshLhm, 5000);
+            }}
+            style={{
+              padding: '6px 16px',
+              background: 'var(--accent)',
+              color: '#fff',
+              border: 'none',
+              borderRadius: 'var(--radius-sm)',
+              fontSize: 13,
+              fontWeight: 600,
+              cursor: 'pointer',
+            }}
+          >
+            Launch
+          </button>
+        </SettingRow>
+      </section>}
 
       {/* ─── Power plan ──────────────────────────────────────────────── */}
       <section className="card">
@@ -563,6 +685,217 @@ export function Settings() {
           </div>
         </div>
       </section>
+    </div>
+  );
+}
+
+// ─── LHM Setup Section ────────────────────────────────────────────
+
+function LhmSetupSection({
+  lhm,
+  step,
+  error,
+  foundZip,
+  onSetup,
+  onFindZip,
+  onOpenDownloadPage,
+}: {
+  lhm: LhmStatus;
+  step: LhmStep;
+  error: string | null;
+  foundZip: string | null;
+  onSetup: () => void;
+  onFindZip: () => void;
+  onOpenDownloadPage: () => void;
+}) {
+  void foundZip;
+  const isWorking = step === 'downloading' || step === 'finding' || step === 'extracting' || step === 'launching' || step === 'verifying';
+
+  return (
+    <section className="card" id="lhm-setup">
+      <div className="card-header">
+        <div>
+          <div className="card-title">LibreHardwareMonitor</div>
+          <div className="card-subtitle">
+            {step === 'done'
+              ? 'Setup complete — enhanced power monitoring is active'
+              : 'Required for CPU and GPU power monitoring on Intel/AMD'}
+          </div>
+        </div>
+        {step === 'done'
+          ? <span className="badge badge-ok">active</span>
+          : <span className="badge badge-warn">needed</span>}
+      </div>
+
+      {step === 'idle' && (
+        <>
+          <div style={{
+            padding: '12px 0',
+            fontSize: 13,
+            color: 'var(--text-subtle)',
+            lineHeight: 1.5,
+          }}>
+            On Intel/AMD laptops, BugJuice uses LibreHardwareMonitor (free, open-source) to read
+            CPU and GPU power sensors. Without it, power breakdown and per-app attribution
+            can't show CPU/GPU data.
+          </div>
+          <div style={{ padding: '4px 0 8px' }}>
+            <button
+              onClick={onSetup}
+              style={{
+                padding: '8px 24px',
+                background: 'var(--accent)',
+                color: '#fff',
+                border: 'none',
+                borderRadius: 'var(--radius-sm)',
+                fontSize: 14,
+                fontWeight: 600,
+                cursor: 'pointer',
+              }}
+            >
+              Set up LibreHardwareMonitor
+            </button>
+          </div>
+        </>
+      )}
+
+      {isWorking && (
+        <div style={{ padding: '12px 0' }}>
+          <SetupStep label="Downloading from GitHub" status={
+            step === 'downloading' ? 'active' :
+            step === 'finding' || step === 'extracting' || step === 'launching' || step === 'verifying' ? 'done' : 'pending'
+          } />
+          <SetupStep label="Extracting" status={
+            step === 'extracting' ? 'active' :
+            step === 'launching' || step === 'verifying' ? 'done' : 'pending'
+          } />
+          <SetupStep label="Launching (accept UAC prompt)" status={
+            step === 'launching' ? 'active' :
+            step === 'verifying' ? 'done' : 'pending'
+          } />
+          <SetupStep label="Verifying connection" status={
+            step === 'verifying' ? 'active' : 'pending'
+          } />
+        </div>
+      )}
+
+      {step === 'download-failed' && (
+        <div style={{ padding: '12px 0' }}>
+          <div style={{
+            padding: '10px 14px',
+            background: 'var(--bg-inset)',
+            borderRadius: 'var(--radius-sm)',
+            fontSize: 13,
+            color: 'var(--text-subtle)',
+            marginBottom: 12,
+          }}>
+            {error || 'Download failed — GitHub may be unreachable.'}
+          </div>
+          <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap' }}>
+            <button
+              onClick={onOpenDownloadPage}
+              style={{
+                padding: '7px 16px',
+                background: 'var(--accent)',
+                color: '#fff',
+                border: 'none',
+                borderRadius: 'var(--radius-sm)',
+                fontSize: 13,
+                fontWeight: 600,
+                cursor: 'pointer',
+              }}
+            >
+              Download manually
+            </button>
+            <button
+              onClick={onFindZip}
+              style={{
+                padding: '7px 16px',
+                background: 'var(--bg-card)',
+                color: 'var(--text)',
+                border: '1px solid var(--border)',
+                borderRadius: 'var(--radius-sm)',
+                fontSize: 13,
+                fontWeight: 500,
+                cursor: 'pointer',
+              }}
+            >
+              I already downloaded it
+            </button>
+          </div>
+        </div>
+      )}
+
+      {step === 'error' && (
+        <div style={{ padding: '12px 0' }}>
+          <div style={{
+            padding: '10px 14px',
+            background: 'var(--bg-inset)',
+            borderRadius: 'var(--radius-sm)',
+            fontSize: 13,
+            color: 'var(--text-subtle)',
+            marginBottom: 12,
+          }}>
+            {error || 'Something went wrong.'}
+          </div>
+          <button
+            onClick={onSetup}
+            style={{
+              padding: '7px 16px',
+              background: 'var(--accent)',
+              color: '#fff',
+              border: 'none',
+              borderRadius: 'var(--radius-sm)',
+              fontSize: 13,
+              fontWeight: 600,
+              cursor: 'pointer',
+            }}
+          >
+            Try again
+          </button>
+        </div>
+      )}
+
+      {step === 'done' && (
+        <div style={{
+          padding: '12px 0',
+          fontSize: 13,
+          color: 'var(--accent)',
+          fontWeight: 500,
+        }}>
+          All set — CPU and GPU power data will appear on the dashboard.
+        </div>
+      )}
+
+      {!lhm.serviceRunning && (
+        <div style={{
+          padding: '8px 0',
+          fontSize: 12,
+          color: 'var(--text-muted)',
+        }}>
+          Note: The BugJuice service is not running. EMI power channels require the service.
+        </div>
+      )}
+    </section>
+  );
+}
+
+function SetupStep({ label, status }: { label: string; status: 'pending' | 'active' | 'done' }) {
+  return (
+    <div style={{
+      display: 'flex',
+      alignItems: 'center',
+      gap: 10,
+      padding: '6px 0',
+      fontSize: 13,
+      color: status === 'active' ? 'var(--text)' : status === 'done' ? 'var(--accent)' : 'var(--text-muted)',
+      fontWeight: status === 'active' ? 500 : 400,
+    }}>
+      <span style={{ width: 18, textAlign: 'center', fontSize: 14 }}>
+        {status === 'done' ? '\u2713' : status === 'active' ? '\u2022' : '\u2013'}
+      </span>
+      {label}
+      {status === 'active' && <span style={{ fontSize: 12, color: 'var(--text-muted)' }}>...</span>}
     </div>
   );
 }

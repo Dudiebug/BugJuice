@@ -9,25 +9,16 @@
   Pop $0
   DetailPrint "Service install exit code: $0"
 
-  ; On x64 (Intel/AMD) only, offer to install LibreHardwareMonitor.
-  ; LHM provides enhanced power monitoring (per-core RAPL, AMD GPU power)
-  ; via its signed PawnIO driver. ARM64 builds skip this — EMI already
-  ; provides rich power channels on Snapdragon X.
+  ; On x64 (Intel/AMD) only, show an informational note about LHM.
+  ; The actual LHM setup is now handled in-app with a guided wizard.
   ;
   ; Check PROCESSOR_ARCHITECTURE to distinguish real x64 from ARM64
   ; (${RunningX64} can be true on ARM64 under emulation).
   ReadEnvStr $1 PROCESSOR_ARCHITECTURE
   ${If} $1 == "AMD64"
-    MessageBox MB_YESNO|MB_ICONQUESTION \
-      "For enhanced power monitoring, BugJuice recommends installing$\n\
-       LibreHardwareMonitor (free, open source).$\n$\n\
-       This enables per-core CPU power, AMD GPU power, and additional$\n\
-       sensors. BugJuice works without it, but with less detail on Intel/AMD.$\n$\n\
-       Open the download page now?" \
-      IDYES lhm_yes IDNO lhm_no
-    lhm_yes:
-      ExecShell "open" "https://github.com/LibreHardwareMonitor/LibreHardwareMonitor/releases"
-    lhm_no:
+    MessageBox MB_OK|MB_ICONINFORMATION \
+      "For full CPU and GPU power monitoring, BugJuice will guide$\n\
+       you through a quick one-time setup on first launch."
   ${EndIf}
 !macroend
 
@@ -36,4 +27,9 @@
   nsExec::ExecToLog '"$INSTDIR\bugjuice-svc.exe" uninstall'
   Pop $0
   DetailPrint "Service uninstall exit code: $0"
+
+  ; Remove the LHM auto-start scheduled task if it exists
+  nsExec::ExecToLog 'schtasks /Delete /TN "BugJuice-LHM" /F'
+  Pop $0
+  DetailPrint "LHM task cleanup exit code: $0"
 !macroend

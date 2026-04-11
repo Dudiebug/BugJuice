@@ -11,6 +11,7 @@ import {
   getBatteryHistory,
   getBatteryStatus,
   getChargeSpeed,
+  getLhmStatus,
   getPowerReading,
   getTopApps,
   getUnplugEstimate,
@@ -21,6 +22,7 @@ import { useApi } from '@/hooks/useApi';
 export function Dashboard() {
   const status = useApi(getBatteryStatus, 2000);
   const power = useApi(getPowerReading, 2000);
+  const lhm = useApi(getLhmStatus, 60_000);
   const appsResponse = useApi(getTopApps, 2000);
   const chargeSpeed = useApi(getChargeSpeed, 5000);
   const unplugEstimate = useApi(getUnplugEstimate, 10_000);
@@ -193,8 +195,9 @@ export function Dashboard() {
           title="CPU package"
           watts={power.cpuPackageW}
           sub={power.source.startsWith('Microsoft') ? 'RAPL via PPM' : 'EMI CPU clusters'}
+          needsSetup={lhm?.needed}
         />
-        <PowerCard title="GPU" watts={power.gpuW} sub="integrated" />
+        <PowerCard title="GPU" watts={power.gpuW} sub="integrated" needsSetup={lhm?.needed} />
       </section>
 
       {/* ─── Battery history chart ────────────────────────────────────── */}
@@ -328,10 +331,12 @@ function PowerCard({
   title,
   watts,
   sub,
+  needsSetup,
 }: {
   title: string;
   watts: number | null;
   sub: string;
+  needsSetup?: boolean;
 }) {
   return (
     <div className="card">
@@ -354,7 +359,16 @@ function PowerCard({
             —
           </div>
           <div className="stat-context" style={{ marginTop: 4 }}>
-            not reported
+            {needsSetup ? (
+              <a
+                href="#/settings"
+                style={{ color: 'var(--accent)', textDecoration: 'none' }}
+              >
+                needs setup
+              </a>
+            ) : (
+              'not reported'
+            )}
           </div>
         </>
       )}
