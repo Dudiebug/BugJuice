@@ -1,12 +1,9 @@
 // Custom build: feeds our own app.manifest to tauri-build so the
-// resulting bugjuice.exe requests requireAdministrator on launch.
+// resulting bugjuice.exe gets the correct manifest embedded.
 //
-// WHY: EMI (Energy Meter Interface) ioctls on Snapdragon X reject
-// callers running at Medium integrity level. Without elevation, every
-// per-channel power reading comes back 0 W and the whole dashboard is
-// useless. Running bugjuice.exe elevated (confirmed by the user) makes
-// EMI succeed. The manifest makes Windows prompt for UAC on each launch
-// so the app runs at High IL automatically.
+// The manifest uses asInvoker — no UAC prompt. Privileged EMI reads
+// are handled by the bugjuice-svc Windows service (runs as SYSTEM).
+// The app connects to the service over a named pipe.
 //
 // We do NOT use the `embed-manifest` crate here -- tauri-build already
 // generates a resource.lib with a default manifest, so adding a second

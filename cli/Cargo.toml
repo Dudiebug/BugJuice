@@ -1,7 +1,7 @@
 [package]
 name = "bugjuice-cli"
 version = "0.1.0"
-edition = "2024"
+edition = "2021"
 description = "BugJuice backend prototype — battery + power sensor CLI"
 
 [dependencies]

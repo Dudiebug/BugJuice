@@ -27,3 +27,4 @@ vite.config.d.ts
 # OS
 Thumbs.db
 .DS_Store
+src-tauri/bugjuice-svc.exe

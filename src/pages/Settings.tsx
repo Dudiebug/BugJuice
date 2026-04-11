@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react';
-import { enableAutostart, disableAutostart, isAutostartEnabled, setNotificationPrefs } from '@/api';
+import { enableAutostart, disableAutostart, isAutostartEnabled, setStartMinimized, getStartMinimized, setNotificationPrefs, setDataRetention, exportReportJson, exportReportPdf, getPowerPlanStatus, setPowerPlanConfig } from '@/api';
+import type { PowerPlanStatus } from '@/api';
 
 // Static example data for the notification preview. This is a design
 // preview only — the real notification in the tray uses live data.
@@ -53,7 +54,7 @@ const DEFAULTS: Prefs = {
   summaryShowTopApp: true,
   summaryOnlyOnBattery: false,
   autostart: true,
-  startMinimized: true,
+  startMinimized: false,
   dataRetentionDays: 30,
 };
 
@@ -70,10 +71,20 @@ function loadPrefs(): Prefs {
 export function Settings() {
   const [prefs, setPrefs] = useState<Prefs>(loadPrefs);
   const [autostartReal, setAutostartReal] = useState(prefs.autostart);
+  const [minimizedReal, setMinimizedReal] = useState(prefs.startMinimized);
 
-  // Load real autostart state from backend on mount
+  const [powerPlan, setPowerPlan] = useState<PowerPlanStatus>({
+    enabled: false,
+    lowThreshold: 30,
+    highThreshold: 80,
+    activeScheme: 'unknown',
+  });
+
+  // Load real autostart + start-minimized + power plan state from backend on mount
   useEffect(() => {
     isAutostartEnabled().then(setAutostartReal).catch(() => {});
+    getStartMinimized().then(setMinimizedReal).catch(() => {});
+    getPowerPlanStatus().then(setPowerPlan).catch(() => {});
   }, []);
 
   useEffect(() => {
@@ -93,6 +104,7 @@ export function Settings() {
       summaryShowDelta: prefs.summaryShowDelta,
       summaryShowTopApp: prefs.summaryShowTopApp,
     }).catch(() => {});
+    setDataRetention(prefs.dataRetentionDays).catch(() => {});
     const root = document.documentElement;
     if (prefs.theme === 'system') {
       root.removeAttribute('data-theme');
@@ -179,6 +191,123 @@ export function Settings() {
             onChange={(v) => update('dataRetentionDays', v)}
           />
         </SettingRow>
+        <SettingRow
+          label="Export data"
+          help="Save a full report (battery status, health, sessions, charge habits)."
+        >
+          <div style={{ display: 'flex', gap: 8 }}>
+            <button
+              onClick={async () => {
+                try {
+                  const r = await exportReportJson();
+                  if (r === 'exported') alert('JSON report exported.');
+                } catch (e) { console.error('export failed:', e); }
+              }}
+              style={{
+                padding: '8px 20px',
+                background: 'var(--accent)',
+                color: '#fff',
+                border: 'none',
+                borderRadius: 'var(--radius-sm)',
+                fontWeight: 600,
+                fontSize: 13,
+                cursor: 'pointer',
+              }}
+            >
+              Export JSON
+            </button>
+            <button
+              onClick={async () => {
+                try {
+                  const r = await exportReportPdf();
+                  if (r === 'exported') alert('PDF report exported.');
+                } catch (e) { console.error('export failed:', e); }
+              }}
+              style={{
+                padding: '8px 20px',
+                background: 'var(--bg-inset)',
+                color: 'var(--text)',
+                border: '1px solid var(--border)',
+                borderRadius: 'var(--radius-sm)',
+                fontWeight: 600,
+                fontSize: 13,
+                cursor: 'pointer',
+              }}
+            >
+              Export PDF
+            </button>
+          </div>
+        </SettingRow>
+      </section>
+
+      {/* ─── Power plan ──────────────────────────────────────────────── */}
+      <section className="card">
+        <div className="card-header">
+          <div>
+            <div className="card-title">Power plan</div>
+            <div className="card-subtitle">
+              Automatically switch Windows power plan based on battery level
+              {powerPlan.activeScheme !== 'unknown' && (
+                <> · current: <strong>{powerPlan.activeScheme}</strong></>
+              )}
+            </div>
+          </div>
+        </div>
+        <SettingRow
+          label="Auto-switch power plan"
+          help="Switch to Power Saver at low battery, Balanced when charged"
+        >
+          <label className="toggle">
+            <input
+              type="checkbox"
+              checked={powerPlan.enabled}
+              onChange={(e) => {
+                const next = { ...powerPlan, enabled: e.target.checked };
+                setPowerPlan(next);
+                setPowerPlanConfig(next.enabled, next.lowThreshold, next.highThreshold).catch(() => {});
+              }}
+            />
+            <span className="toggle-track" />
+          </label>
+        </SettingRow>
+        {powerPlan.enabled && (
+          <>
+            <SettingRow
+              label="Power Saver below"
+              help="Switch to Power Saver when battery drops below this level"
+            >
+              <Slider
+                min={5}
+                max={50}
+                step={5}
+                value={powerPlan.lowThreshold}
+                unit="%"
+                onChange={(v) => {
+                  const next = { ...powerPlan, lowThreshold: v };
+                  setPowerPlan(next);
+                  setPowerPlanConfig(next.enabled, next.lowThreshold, next.highThreshold).catch(() => {});
+                }}
+              />
+            </SettingRow>
+            <SettingRow
+              label="Balanced above"
+              help="Switch back to Balanced when battery rises above this level"
+            >
+              <Slider
+                min={powerPlan.lowThreshold + 10}
+                max={100}
+                step={5}
+                value={powerPlan.highThreshold}
+                unit="%"
+                onChange={(v) => {
+                  const next = { ...powerPlan, highThreshold: v };
+                  setPowerPlan(next);
+                  setPowerPlanConfig(next.enabled, next.lowThreshold, next.highThreshold).catch(() => {});
+                }}
+              />
+            </SettingRow>
+          </>
+        )}
       </section>
 
       {/* ─── Notifications ──────────────────────────────────────────── */}
@@ -381,8 +510,16 @@ export function Settings() {
           help="Hide the window on startup; click the tray icon to open"
         >
           <Toggle
-            checked={prefs.startMinimized}
-            onChange={(v) => update('startMinimized', v)}
+            checked={minimizedReal}
+            onChange={async (v: boolean) => {
+              update('startMinimized', v);
+              try {
+                await setStartMinimized(v);
+                setMinimizedReal(v);
+              } catch (e) {
+                console.error('start-minimized toggle failed:', e);
+              }
+            }}
           />
         </SettingRow>
       </section>
@@ -400,7 +537,7 @@ export function Settings() {
         >
           <div>
             <strong style={{ color: 'var(--text)' }}>BugJuice</strong> by
-            DudieBug — v0.1 prototype
+            DudieBug — v0.2.1 beta
           </div>
           <div style={{ marginTop: 6 }}>
             Open source battery monitoring for Windows. Built with Tauri,

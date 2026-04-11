@@ -84,7 +84,7 @@ export function Sidebar() {
         ))}
       </nav>
 
-      <div className="sidebar-footer">v0.1 prototype</div>
+      <div className="sidebar-footer">v0.2.1 beta</div>
     </aside>
   );
 }

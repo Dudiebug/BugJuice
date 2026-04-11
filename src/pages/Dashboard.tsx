@@ -10,8 +10,10 @@ import {
 import {
   getBatteryHistory,
   getBatteryStatus,
+  getChargeSpeed,
   getPowerReading,
   getTopApps,
+  getUnplugEstimate,
 } from '@/api';
 import { BatteryGauge } from '@/components/BatteryGauge';
 import { useApi } from '@/hooks/useApi';
@@ -20,6 +22,8 @@ export function Dashboard() {
   const status = useApi(getBatteryStatus, 2000);
   const power = useApi(getPowerReading, 2000);
   const appsResponse = useApi(getTopApps, 2000);
+  const chargeSpeed = useApi(getChargeSpeed, 5000);
+  const unplugEstimate = useApi(getUnplugEstimate, 10_000);
   const history = useApi(() => getBatteryHistory(60), 30_000);
 
   if (!status || !power) {
@@ -35,6 +39,7 @@ export function Dashboard() {
 
   const apps = (appsResponse?.apps ?? []).slice(0, 6);
   const rateAbs = Math.abs(status.rateW);
+  const rateKnown = rateAbs >= 0.01;
   const charging = status.rateW > 0;
 
   return (
@@ -60,14 +65,121 @@ export function Dashboard() {
               {status.etaLabel}
             </div>
             <div className="stat-label" style={{ marginTop: 12 }}>
-              {charging ? 'CHARGING AT' : 'DRAINING AT'}&nbsp;
-              <strong style={{ fontSize: 18, color: 'var(--text)' }}>
-                {rateAbs.toFixed(2)} W
-              </strong>
+              {rateKnown ? (
+                <>
+                  {charging ? 'CHARGING AT' : 'DRAINING AT'}&nbsp;
+                  <strong style={{ fontSize: 18, color: 'var(--text)' }}>
+                    {rateAbs.toFixed(2)} W
+                  </strong>
+                </>
+              ) : status.onAc ? (
+                <strong style={{ fontSize: 18, color: 'var(--text)' }}>
+                  On AC
+                </strong>
+              ) : (
+                <strong style={{ fontSize: 18, color: 'var(--text-muted)' }}>
+                  Rate not available
+                </strong>
+              )}
             </div>
           </div>
         </div>
       </section>
+
+      {/* ─── Charging speed card (visible only while charging) ────────── */}
+      {status.onAc && chargeSpeed && chargeSpeed.currentRateW > 0.1 && (
+        <section className="card">
+          <div className="card-header">
+            <div>
+              <div className="card-title">Charging speed</div>
+              <div className="card-subtitle">{chargeSpeed.etaLabel}</div>
+            </div>
+            <span className="badge badge-ok">charging</span>
+          </div>
+          <div
+            style={{
+              display: 'grid',
+              gridTemplateColumns: '1fr 1fr 1fr 1fr',
+              gap: 24,
+              marginTop: 12,
+            }}
+          >
+            <MiniStat
+              label="Current"
+              value={`${chargeSpeed.currentRateW.toFixed(1)} W`}
+            />
+            <MiniStat
+              label="Peak this session"
+              value={`${chargeSpeed.maxRateW.toFixed(1)} W`}
+            />
+            <MiniStat
+              label="Average"
+              value={`${chargeSpeed.avgRateW.toFixed(1)} W`}
+            />
+            <MiniStat
+              label="Gained"
+              value={`+${(chargeSpeed.currentPercent - chargeSpeed.startPercent).toFixed(1)}%`}
+            />
+          </div>
+        </section>
+      )}
+
+      {/* ─── "Before I unplug" estimate (visible only on AC) ────────── */}
+      {status.onAc && unplugEstimate && unplugEstimate.totalHours > 0 && (
+        <section className="card">
+          <div className="card-header">
+            <div>
+              <div className="card-title">If you unplug now</div>
+              <div className="card-subtitle">{unplugEstimate.totalLabel}</div>
+            </div>
+          </div>
+          {unplugEstimate.topDrains.length > 0 && (
+            <div style={{ marginTop: 12, fontSize: 13 }}>
+              {unplugEstimate.topDrains.map((d) => (
+                <div
+                  key={d.name}
+                  style={{
+                    display: 'flex',
+                    justifyContent: 'space-between',
+                    padding: '6px 0',
+                    borderBottom: '1px solid var(--border)',
+                  }}
+                >
+                  <span>{d.name}</span>
+                  <span style={{ color: 'var(--text-muted)', fontVariantNumeric: 'tabular-nums' }}>
+                    {d.watts.toFixed(2)} W
+                  </span>
+                </div>
+              ))}
+              {unplugEstimate.systemOverheadW > 0.1 && (
+                <div
+                  style={{
+                    display: 'flex',
+                    justifyContent: 'space-between',
+                    padding: '6px 0',
+                    color: 'var(--text-muted)',
+                    fontSize: 12,
+                  }}
+                >
+                  <span>System / platform</span>
+                  <span style={{ fontVariantNumeric: 'tabular-nums' }}>
+                    {unplugEstimate.systemOverheadW.toFixed(2)} W
+                  </span>
+                </div>
+              )}
+            </div>
+          )}
+          <div
+            style={{
+              marginTop: 10,
+              fontSize: 11,
+              color: 'var(--text-muted)',
+            }}
+          >
+            Based on current usage — actual battery life depends on what you run
+          </div>
+        </section>
+      )}
 
       {/* ─── Power breakdown ──────────────────────────────────────────── */}
       <section className="grid grid-4">
@@ -178,20 +290,14 @@ export function Dashboard() {
       </section>
 
       {/* ─── Secondary stats ──────────────────────────────────────────── */}
-      <section className="grid grid-3">
-        <MiniStat
+      <section className="grid grid-2">
+        <StatCard
           label="Voltage"
           value={status.voltageV.toFixed(2)}
           unit="V"
           context={`${status.capacityMwh.toLocaleString()} mWh of ${status.fullChargeMwh.toLocaleString()}`}
         />
-        <MiniStat
-          label="Temperature"
-          value={status.tempC ? status.tempC.toFixed(1) : '—'}
-          unit="°C"
-          context={temperatureContext(status.tempC)}
-        />
-        <MiniStat
+        <StatCard
           label="Health"
           value={(100 - status.wearPercent).toFixed(0)}
           unit="%"
@@ -207,6 +313,15 @@ export function Dashboard() {
 function StateBadge({ onAc, rateW }: { onAc: boolean; rateW: number }) {
   const label = onAc && rateW > 0.1 ? 'Charging' : onAc ? 'On AC' : 'On battery';
   return <span className="badge badge-ok">{label}</span>;
+}
+
+function MiniStat({ label, value }: { label: string; value: string }) {
+  return (
+    <div>
+      <div className="stat-label">{label}</div>
+      <div style={{ fontSize: 20, fontWeight: 600, marginTop: 4 }}>{value}</div>
+    </div>
+  );
 }
 
 function PowerCard({
@@ -272,7 +387,7 @@ function AppRow({
   );
 }
 
-function MiniStat({
+function StatCard({
   label,
   value,
   unit,
@@ -297,10 +412,3 @@ function MiniStat({
   );
 }
 
-function temperatureContext(c: number | null): string {
-  if (c === null) return 'not available';
-  if (c < 25) return 'cool';
-  if (c < 35) return 'normal';
-  if (c < 45) return 'warm';
-  return 'hot — check airflow';
-}

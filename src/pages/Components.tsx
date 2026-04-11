@@ -45,22 +45,39 @@ export function Components() {
   // minus the component breakdown.
   const other = Math.max(0, system - cpu - gpu - dram);
 
+  // Modem/NPU values come from the history stream (not the live power reading).
+  // For the pie chart, use the latest history point if available.
+  const latestHist = (history ?? []).at(-1);
+  const modem = latestHist?.modem ?? 0;
+  const npu = latestHist?.npu ?? 0;
+
   const slices: Slice[] = [
     { name: 'CPU', value: cpu, fill: 'var(--chart-1)', desc: 'processor package' },
     { name: 'GPU', value: gpu, fill: 'var(--chart-2)', desc: 'integrated graphics' },
     { name: 'DRAM', value: dram, fill: 'var(--chart-3)', desc: 'memory subsystem' },
+    { name: 'Modem', value: modem, fill: 'var(--chart-5, #f59e0b)', desc: 'cellular modem' },
+    { name: 'NPU', value: npu, fill: 'var(--chart-6, #8b5cf6)', desc: 'neural processing' },
     { name: 'Other', value: other, fill: 'var(--chart-4)', desc: 'display, Wi-Fi, platform' },
   ].filter((s) => s.value > 0.01);
 
   const total = slices.reduce((acc, s) => acc + s.value, 0);
   const biggest = [...slices].sort((a, b) => b.value - a.value)[0];
 
+  // Detect if any LHM-sourced channels are present in the raw channel list.
+  const hasLhm = (power.channels ?? []).some(
+    (ch: { name: string }) => ch.name.startsWith('power_lhm_'),
+  );
+
   return (
     <div className="page">
       <header className="page-header">
-        <h1 className="page-title">Components</h1>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+          <h1 className="page-title">Components</h1>
+          {hasLhm && <span className="badge badge-ok">enhanced</span>}
+        </div>
         <p className="page-subtitle">
           Power breakdown by subsystem · {power.source}
+          {hasLhm && ' + LibreHardwareMonitor'}
         </p>
       </header>
 
@@ -311,6 +328,26 @@ export function Components() {
                 stroke="var(--chart-3)"
                 strokeWidth={1.5}
                 fill="url(#fill-dram)"
+                isAnimationActive={false}
+              />
+              <Area
+                type="monotone"
+                dataKey="modem"
+                stackId="1"
+                stroke="var(--chart-5, #f59e0b)"
+                strokeWidth={1.5}
+                fill="var(--chart-5, #f59e0b)"
+                fillOpacity={0.3}
+                isAnimationActive={false}
+              />
+              <Area
+                type="monotone"
+                dataKey="npu"
+                stackId="1"
+                stroke="var(--chart-6, #8b5cf6)"
+                strokeWidth={1.5}
+                fill="var(--chart-6, #8b5cf6)"
+                fillOpacity={0.3}
                 isAnimationActive={false}
               />
               <Area

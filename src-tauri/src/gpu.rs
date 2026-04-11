@@ -195,3 +195,121 @@ unsafe fn read_wide_string(ptr: *const u16) -> String {
     let slice = std::slice::from_raw_parts(ptr, len);
     String::from_utf16_lossy(slice)
 }
+
+// ─── NVML GPU Power ─────────────────────────────────────────────────────────
+//
+// On NVIDIA systems, nvml.dll ships with the driver and exposes actual GPU
+// wattage via on-board current shunt resistors. We load it dynamically so
+// the app works fine on systems without NVIDIA GPUs.
+
+const NVML_SUCCESS: u32 = 0;
+
+// Function pointer types matching the NVML C API.
+type NvmlInit = unsafe extern "C" fn() -> u32;
+type NvmlShutdown = unsafe extern "C" fn() -> u32;
+type NvmlDeviceGetCount = unsafe extern "C" fn(*mut u32) -> u32;
+type NvmlDeviceGetHandleByIndex = unsafe extern "C" fn(u32, *mut *mut c_void) -> u32;
+type NvmlDeviceGetPowerUsage = unsafe extern "C" fn(*mut c_void, *mut u32) -> u32;
+
+pub struct NvmlPower {
+    _lib: libloading::Library,
+    handles: Vec<*mut c_void>,
+    fn_get_power: NvmlDeviceGetPowerUsage,
+    fn_shutdown: NvmlShutdown,
+}
+
+// SAFETY: we only use NvmlPower from the polling thread.
+unsafe impl Send for NvmlPower {}
+
+impl NvmlPower {
+    /// Try to load NVML and enumerate GPU devices. Returns None if NVML
+    /// isn't available (no NVIDIA GPU or driver not installed).
+    pub fn new() -> Option<Self> {
+        // Try the standard system path first, then the NVSMI folder.
+        let lib = unsafe {
+            libloading::Library::new("nvml.dll")
+                .or_else(|_| {
+                    libloading::Library::new(
+                        r"C:\Program Files\NVIDIA Corporation\NVSMI\nvml.dll",
+                    )
+                })
+                .ok()?
+        };
+
+        unsafe {
+            let init: libloading::Symbol<NvmlInit> = lib.get(b"nvmlInit_v2\0").ok()?;
+            if init() != NVML_SUCCESS {
+                return None;
+            }
+
+            let get_count: libloading::Symbol<NvmlDeviceGetCount> =
+                lib.get(b"nvmlDeviceGetCount_v2\0").ok()?;
+            let mut count: u32 = 0;
+            if get_count(&mut count) != NVML_SUCCESS || count == 0 {
+                let shutdown: libloading::Symbol<NvmlShutdown> =
+                    lib.get(b"nvmlShutdown\0").ok()?;
+                shutdown();
+                return None;
+            }
+
+            let get_handle: libloading::Symbol<NvmlDeviceGetHandleByIndex> =
+                lib.get(b"nvmlDeviceGetHandleByIndex_v2\0").ok()?;
+            let mut handles = Vec::with_capacity(count as usize);
+            for i in 0..count {
+                let mut handle: *mut c_void = ptr::null_mut();
+                if get_handle(i, &mut handle) == NVML_SUCCESS {
+                    handles.push(handle);
+                }
+            }
+            if handles.is_empty() {
+                let shutdown: libloading::Symbol<NvmlShutdown> =
+                    lib.get(b"nvmlShutdown\0").ok()?;
+                shutdown();
+                return None;
+            }
+
+            let fn_get_power: NvmlDeviceGetPowerUsage =
+                *lib.get::<NvmlDeviceGetPowerUsage>(b"nvmlDeviceGetPowerUsage\0").ok()?;
+            let fn_shutdown: NvmlShutdown =
+                *lib.get::<NvmlShutdown>(b"nvmlShutdown\0").ok()?;
+
+            log::info!(
+                "NVML initialized: {} GPU device(s)",
+                handles.len()
+            );
+
+            Some(NvmlPower {
+                _lib: lib,
+                handles,
+                fn_get_power,
+                fn_shutdown,
+            })
+        }
+    }
+
+    /// Read the total GPU power across all NVIDIA devices. Returns watts.
+    pub fn read_total_watts(&self) -> Option<f64> {
+        let mut total_mw: u64 = 0;
+        let mut ok = false;
+        for &handle in &self.handles {
+            let mut power_mw: u32 = 0;
+            if unsafe { (self.fn_get_power)(handle, &mut power_mw) } == NVML_SUCCESS {
+                total_mw += power_mw as u64;
+                ok = true;
+            }
+        }
+        if ok {
+            Some(total_mw as f64 / 1000.0)
+        } else {
+            None
+        }
+    }
+}
+
+impl Drop for NvmlPower {
+    fn drop(&mut self) {
+        unsafe {
+            (self.fn_shutdown)();
+        }
+    }
+}

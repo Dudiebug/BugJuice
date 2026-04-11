@@ -216,7 +216,7 @@ pub fn quick_capacity_mwh() -> Result<u32, String> {
 unsafe fn probe_single(device_path: PCWSTR) -> Result<BatterySnapshot, String> {
     let handle = CreateFileW(
         device_path,
-        GENERIC_READ | GENERIC_WRITE,
+        GENERIC_READ,
         FILE_SHARE_READ | FILE_SHARE_WRITE,
         None,
         OPEN_EXISTING,

@@ -6,7 +6,7 @@ import {
   ComposedChart,
   ReferenceArea,
   ResponsiveContainer,
-  Scatter,
+
   Tooltip,
   XAxis,
   YAxis,
@@ -61,20 +61,43 @@ export function Sessions() {
     [batterySessions],
   );
 
+  // ── Gap detection ──────────────────────────────────────────────────
+  // Walk through consecutive history points and flag time gaps where the
+  // app wasn't recording (sleep, laptop off, etc.). Gaps that overlap a
+  // known sleep session are tagged as "sleep"; everything else is
+  // "interpolated" and will be shown with diagonal hatching.
+  const GAP_THRESHOLD = 300; // 5 minutes in seconds
+
+  const gaps = useMemo(() => {
+    if (history.length < 2) return [] as GapRegion[];
+    const result: GapRegion[] = [];
+    for (let i = 0; i < history.length - 1; i++) {
+      const curr = history[i];
+      const next = history[i + 1];
+      if (next.ts - curr.ts > GAP_THRESHOLD) {
+        const isSleep = sleepSessions.some(
+          (s) => s.sleepAt < next.ts && (s.wakeAt ?? Infinity) > curr.ts,
+        );
+        result.push({
+          startTs: curr.ts,
+          endTs: next.ts,
+          type: isSleep ? 'sleep' : 'interpolated',
+        });
+      }
+    }
+    return result;
+  }, [history, sleepSessions, GAP_THRESHOLD]);
+
+  const interpolatedGaps = useMemo(
+    () => gaps.filter((g) => g.type === 'interpolated'),
+    [gaps],
+  );
+
   // Summary stats
   const stats = useMemo(
     () => computeStats(batterySessions, sleepSessions),
     [batterySessions, sleepSessions],
   );
-
-  // Anomaly points: where discharge rate exceeds 2x average
-  const anomalyPoints = useMemo(() => {
-    if (stats.avgDrainW === 0) return [];
-    const threshold = Math.abs(stats.avgDrainW) * 2;
-    return history
-      .filter((p) => p.rateW < 0 && Math.abs(p.rateW) > threshold)
-      .map((p) => ({ ts: p.ts, percent: p.percent }));
-  }, [history, stats.avgDrainW]);
 
   // Unified session list (sorted newest first)
   const allSessions = useMemo(() => {
@@ -89,13 +112,37 @@ export function Sessions() {
     return items;
   }, [batterySessions, sleepSessions]);
 
+  // X-axis tick positions — we generate clean hour / day boundaries
+  // so the numeric axis has well-placed labels.
+  const xTicks = useMemo(() => {
+    if (history.length === 0) return [];
+    const min = history[0].ts;
+    const max = history[history.length - 1].ts;
+    const range = max - min;
+    let interval: number;
+    if (range <= 86400) {
+      interval = 3600; // every hour for <= 1 day
+    } else if (range <= 86400 * 3) {
+      interval = 3600 * 6; // every 6h for <= 3 days
+    } else {
+      interval = 86400; // every day for longer ranges
+    }
+    const ticks: number[] = [];
+    let tick = Math.ceil(min / interval) * interval;
+    while (tick <= max) {
+      ticks.push(tick);
+      tick += interval;
+    }
+    return ticks;
+  }, [history]);
+
   // X-axis time formatter based on view mode
   const formatAxisTime = (ts: number) => {
     const d = new Date(ts * 1000);
     if (viewMode === 'day') {
-      return d.toLocaleTimeString(undefined, { hour: 'numeric', hour12: true });
+      return d.toLocaleTimeString(undefined, { hour: 'numeric', minute: '2-digit', hour12: true });
     }
-    return d.toLocaleDateString(undefined, { weekday: 'short' });
+    return d.toLocaleDateString(undefined, { weekday: 'short', hour: 'numeric', hour12: true });
   };
 
   // Handle chart click for day drill-down
@@ -257,6 +304,22 @@ export function Sessions() {
                     <stop offset="0%" stopColor="var(--accent)" stopOpacity={0.45} />
                     <stop offset="100%" stopColor="var(--accent)" stopOpacity={0.02} />
                   </linearGradient>
+                  {/* Diagonal hatching for interpolated (no-data) regions */}
+                  <pattern
+                    id="hatchInterpolated"
+                    patternUnits="userSpaceOnUse"
+                    width="8"
+                    height="8"
+                    patternTransform="rotate(45)"
+                  >
+                    <rect width="8" height="8" fill="rgba(255, 255, 255, 0.03)" />
+                    <line
+                      x1="0" y1="0" x2="0" y2="8"
+                      stroke="var(--text-muted)"
+                      strokeWidth="1.5"
+                      strokeOpacity="0.25"
+                    />
+                  </pattern>
                 </defs>
 
                 <CartesianGrid
@@ -265,15 +328,29 @@ export function Sessions() {
                   vertical={false}
                 />
 
+                {/* Interpolated gap bands (diagonal hatching) — no-data
+                    regions that aren't sleep. Rendered first so they sit
+                    behind charging / sleep bands. */}
+                {interpolatedGaps.map((g, i) => (
+                  <ReferenceArea
+                    key={`interp-${i}`}
+                    x1={g.startTs}
+                    x2={g.endTs}
+                    fill="url(#hatchInterpolated)"
+                    fillOpacity={1}
+                    isFront
+                  />
+                ))}
+
                 {/* Charging session bands (green) */}
                 {chargingSessions.map((s, i) => (
                   <ReferenceArea
                     key={`charge-${i}`}
                     x1={s.startedAt}
-                    x2={s.endedAt ?? Math.floor(Date.now() / 1000)}
-                    fill="rgba(34, 197, 94, 0.15)"
+                    x2={s.endedAt ?? history[history.length - 1]?.ts ?? s.startedAt}
+                    fill="rgba(34, 197, 94, 0.2)"
                     fillOpacity={1}
-                    ifOverflow="hidden"
+                    isFront
                   />
                 ))}
 
@@ -282,15 +359,23 @@ export function Sessions() {
                   <ReferenceArea
                     key={`sleep-${i}`}
                     x1={s.sleepAt}
-                    x2={s.wakeAt ?? Math.floor(Date.now() / 1000)}
-                    fill="rgba(139, 92, 246, 0.15)"
+                    x2={s.wakeAt ?? history[history.length - 1]?.ts ?? s.sleepAt}
+                    fill="rgba(139, 92, 246, 0.25)"
                     fillOpacity={1}
-                    ifOverflow="hidden"
+                    isFront
                   />
                 ))}
 
+                {/* CRITICAL: type="number" makes this a continuous numeric
+                    axis instead of categorical. Without it, ReferenceArea
+                    x1/x2 must exactly match a data point ts — which session
+                    timestamps never do, so bands silently vanish. */}
                 <XAxis
                   dataKey="ts"
+                  type="number"
+                  domain={['dataMin', 'dataMax']}
+                  scale="linear"
+                  ticks={xTicks}
                   stroke="var(--text-muted)"
                   fontSize={11}
                   tickLine={false}
@@ -314,7 +399,7 @@ export function Sessions() {
                 />
 
                 <Area
-                  type="monotone"
+                  type="linear"
                   dataKey="percent"
                   stroke="var(--accent)"
                   strokeWidth={2}
@@ -322,20 +407,7 @@ export function Sessions() {
                   isAnimationActive={false}
                 />
 
-                {/* Anomaly dots (high discharge) */}
-                {anomalyPoints.length > 0 && (
-                  <Scatter
-                    data={anomalyPoints}
-                    dataKey="percent"
-                    fill="#ef4444"
-                    isAnimationActive={false}
-                    name="Anomaly"
-                    shape={((props: unknown) => {
-                      const { cx, cy } = props as { cx: number; cy: number };
-                      return <circle cx={cx} cy={cy} r={4} fill="#ef4444" />;
-                    }) as (props: unknown) => React.JSX.Element}
-                  />
-                )}
+
               </ComposedChart>
             </ResponsiveContainer>
           )}
@@ -356,7 +428,9 @@ export function Sessions() {
           >
             <LegendItem color="rgba(34, 197, 94, 0.4)" label="Charging" />
             <LegendItem color="rgba(139, 92, 246, 0.4)" label="Sleep" />
-            <LegendItem color="#ef4444" label="Anomaly (>2x avg drain)" dot />
+            {interpolatedGaps.length > 0 && (
+              <LegendItem color="" label="Interpolated" hatched />
+            )}
             {viewMode === 'week' && (
               <span style={{ marginLeft: 'auto', fontStyle: 'italic' }}>
                 Click chart to view a single day
@@ -429,51 +503,61 @@ export function Sessions() {
             <div className="card-title">
               Top Apps {viewMode === 'day' ? 'Today' : viewMode === 'week' ? 'This Week' : ''}
             </div>
-            <div className="card-subtitle">Aggregated app power usage for this period</div>
+            <div className="card-subtitle">Share of battery usage for this period</div>
           </div>
         </div>
-        {(data?.appPowerSummary ?? []).length === 0 ? (
-          <p className="stat-context" style={{ padding: '12px 0' }}>
-            No app power data for this period
-          </p>
-        ) : (
-          <div>
-            {(data?.appPowerSummary ?? []).map((app) => (
-              <div
-                key={app.name}
-                style={{
-                  display: 'flex',
-                  justifyContent: 'space-between',
-                  alignItems: 'center',
-                  padding: '10px 0',
-                  borderBottom: '1px solid var(--border)',
-                }}
-              >
-                <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-                  <span
+        {(() => {
+          const appSummary = data?.appPowerSummary ?? [];
+          const totalEnergy = appSummary.reduce((sum, a) => sum + a.totalEnergy, 0);
+          if (appSummary.length === 0) {
+            return (
+              <p className="stat-context" style={{ padding: '12px 0' }}>
+                No app power data for this period
+              </p>
+            );
+          }
+          return (
+            <div>
+              {appSummary.map((app) => {
+                const pct = totalEnergy > 0 ? (app.totalEnergy / totalEnergy) * 100 : 0;
+                return (
+                  <div
+                    key={app.name}
                     style={{
-                      width: 8,
-                      height: 8,
-                      borderRadius: '50%',
-                      flexShrink: 0,
-                      background:
-                        app.avgWatts > 3
-                          ? 'var(--bad)'
-                          : app.avgWatts > 1
-                            ? 'var(--warn)'
-                            : 'var(--ok)',
+                      display: 'flex',
+                      alignItems: 'center',
+                      padding: '10px 0',
+                      borderBottom: '1px solid var(--border)',
+                      gap: 10,
                     }}
-                  />
-                  <span style={{ fontWeight: 500, fontSize: 14 }}>{app.name}</span>
-                </div>
-                <div style={{ display: 'flex', gap: 16, color: 'var(--text-subtle)', fontSize: 13, fontVariantNumeric: 'tabular-nums' }}>
-                  <span>avg {app.avgWatts.toFixed(1)} W</span>
-                  <span>peak {app.maxWatts.toFixed(1)} W</span>
-                </div>
-              </div>
-            ))}
-          </div>
-        )}
+                  >
+                    <span
+                      style={{
+                        width: 8,
+                        height: 8,
+                        borderRadius: '50%',
+                        flexShrink: 0,
+                        background:
+                          pct > 30
+                            ? 'var(--bad)'
+                            : pct > 15
+                              ? 'var(--warn)'
+                              : 'var(--ok)',
+                      }}
+                    />
+                    <span style={{ fontWeight: 500, fontSize: 14, flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{app.name}</span>
+                    <div style={{ width: 100, height: 6, borderRadius: 3, background: 'var(--bg-inset)', flexShrink: 0 }}>
+                      <div style={{ width: `${Math.min(pct, 100)}%`, height: '100%', borderRadius: 3, background: pct > 30 ? 'var(--bad)' : pct > 15 ? 'var(--warn)' : 'var(--accent)' }} />
+                    </div>
+                    <span style={{ fontWeight: 600, fontSize: 14, fontVariantNumeric: 'tabular-nums', minWidth: 48, textAlign: 'right' }}>
+                      {pct.toFixed(1)}%
+                    </span>
+                  </div>
+                );
+              })}
+            </div>
+          );
+        })()}
       </section>
 
       {/* ─── Session list ──────────────────────────────────────────── */}
@@ -557,11 +641,34 @@ function LegendItem({
   color,
   label,
   dot,
+  hatched,
 }: {
   color: string;
   label: string;
   dot?: boolean;
+  hatched?: boolean;
 }) {
+  if (hatched) {
+    return (
+      <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+        <svg width={16} height={8} style={{ flexShrink: 0 }}>
+          <defs>
+            <pattern
+              id="legendHatch"
+              patternUnits="userSpaceOnUse"
+              width="4"
+              height="4"
+              patternTransform="rotate(45)"
+            >
+              <line x1="0" y1="0" x2="0" y2="4" stroke="currentColor" strokeWidth="1" opacity="0.5" />
+            </pattern>
+          </defs>
+          <rect width={16} height={8} rx={2} fill="url(#legendHatch)" stroke="currentColor" strokeWidth="0.5" strokeOpacity="0.3" />
+        </svg>
+        <span>{label}</span>
+      </div>
+    );
+  }
   return (
     <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
       <span
@@ -816,6 +923,12 @@ function VerdictBadge({ verdict }: { verdict: SleepSession['verdict'] }) {
 }
 
 // ─── Helpers ────────────────────────────────────────────────────────
+
+interface GapRegion {
+  startTs: number;
+  endTs: number;
+  type: 'sleep' | 'interpolated';
+}
 
 interface UnifiedSessionItem {
   type: 'battery' | 'sleep';

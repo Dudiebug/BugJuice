@@ -7,8 +7,11 @@ mod battery;
 mod commands;
 mod events;
 mod gpu;
+mod lhm;
+mod pipe_client;
 mod polling;
 mod power;
+mod power_plan;
 mod processes;
 mod storage;
 
@@ -74,14 +77,32 @@ pub(crate) fn format_hours(h: f64) -> String {
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_notification::init())
+        .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
+        .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_autostart::init(
             tauri_plugin_autostart::MacosLauncher::LaunchAgent,
-            Some(vec!["--minimized"]),
+            None,
         ))
         .setup(|app| {
             // Store the AppHandle globally so the polling thread and event
             // callbacks can access tray icon and notification APIs.
             APP_HANDLE.set(app.handle().clone()).ok();
+
+            // ── Auto-enable autostart on first launch ─────────────────
+            {
+                let data_dir = app
+                    .path()
+                    .app_data_dir()
+                    .unwrap_or_else(|_| PathBuf::from("."));
+                let marker = data_dir.join(".autostart-initialized");
+                if !marker.exists() {
+                    use tauri_plugin_autostart::ManagerExt;
+                    let _ = app.autolaunch().enable();
+                    let _ = std::fs::create_dir_all(&data_dir);
+                    let _ = std::fs::write(&marker, "1");
+                }
+            }
 
             // Database lives in the per-user app data dir, e.g.
             //   C:\Users\<user>\AppData\Roaming\com.dudiebug.bugjuice\bugjuice.db
@@ -95,6 +116,16 @@ pub fn run() {
                 eprintln!("storage init failed at {:?}: {e}", db_path);
             } else {
                 log::info!("storage opened at {db_path:?}");
+                // Prune stale data on startup using the default retention.
+                if let Some(s) = storage::global() {
+                    let days = commands::data_retention_days();
+                    match s.prune_old_data(days) {
+                        Ok((r, a)) if r + a > 0 => {
+                            log::info!("startup prune: {r} readings + {a} app_power rows");
+                        }
+                        _ => {}
+                    }
+                }
             }
 
             // Match the "don't be a battery hog" rule from the scope doc:
@@ -144,8 +175,15 @@ pub fn run() {
 
             TRAY_MENU.set(menu.clone()).ok();
 
+            let tray_icon = app
+                .default_window_icon()
+                .cloned()
+                .unwrap_or_else(|| {
+                    tauri::image::Image::from_bytes(include_bytes!("../icons/icon.ico"))
+                        .expect("failed to load tray icon from icons/icon.ico")
+                });
             let _tray = TrayIconBuilder::with_id("main")
-                .icon(app.default_window_icon().unwrap().clone())
+                .icon(tray_icon)
                 .menu(&menu)
                 .tooltip("BugJuice")
                 .on_menu_event(|app, event| match event.id.as_ref() {
@@ -182,6 +220,23 @@ pub fn run() {
                 })
                 .build(app)?;
 
+            // ── Start minimized to tray ─────────────────────────────
+            // The window starts hidden (visible: false in tauri.conf.json).
+            // Show it now unless the user opted to start minimized to tray.
+            {
+                let data_dir = app
+                    .path()
+                    .app_data_dir()
+                    .unwrap_or_else(|_| PathBuf::from("."));
+                let start_minimized = data_dir.join(".start-minimized").exists();
+                if !start_minimized {
+                    if let Some(w) = app.get_webview_window("main") {
+                        let _ = w.show();
+                        let _ = w.set_focus();
+                    }
+                }
+            }
+
             if cfg!(debug_assertions) {
                 app.handle().plugin(
                     tauri_plugin_log::Builder::default()
@@ -217,6 +272,17 @@ pub fn run() {
             commands::enable_autostart,
             commands::disable_autostart,
             commands::is_autostart_enabled,
+            commands::set_start_minimized,
+            commands::get_start_minimized,
+            commands::test_notification,
+            commands::get_charge_speed,
+            commands::get_charge_habits,
+            commands::export_report_json,
+            commands::export_report_pdf,
+            commands::get_unplug_estimate,
+            commands::get_power_plan_status,
+            commands::set_power_plan_config,
+            commands::set_data_retention,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

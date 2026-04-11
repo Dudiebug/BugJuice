@@ -22,6 +22,8 @@ export interface ComponentHistoryPoint {
   cpu: number;
   gpu: number;
   dram: number;
+  modem: number;
+  npu: number;
   other: number;
 }
 
@@ -30,6 +32,7 @@ export interface AppPowerSummary {
   avgWatts: number;
   maxWatts: number;
   sampleCount: number;
+  totalEnergy: number;
 }
 
 export interface SessionDetailPoint {
@@ -147,12 +150,14 @@ export interface TopAppsResponse {
   apps: AppPowerRow[];
   confidencePercent: number;
   batteryDischargeW: number;
+  systemOverheadW: number;
 }
 
 const EMPTY_TOP_APPS: TopAppsResponse = {
   apps: [],
   confidencePercent: 0,
   batteryDischargeW: 0,
+  systemOverheadW: 0,
 };
 
 export async function getTopApps(): Promise<TopAppsResponse> {
@@ -232,6 +237,151 @@ export async function disableAutostart(): Promise<void> {
 
 export async function isAutostartEnabled(): Promise<boolean> {
   return safe('is_autostart_enabled', false);
+}
+
+// ─── Start minimized ──────────────────────────────────────────────────────
+export async function setStartMinimized(enabled: boolean): Promise<void> {
+  return safe('set_start_minimized', undefined, { enabled });
+}
+
+export async function getStartMinimized(): Promise<boolean> {
+  return safe('get_start_minimized', false);
+}
+
+// ─── Charge speed ──────────────────────────────────────────────────────
+
+export interface ChargeSpeed {
+  currentRateW: number;
+  maxRateW: number;
+  avgRateW: number;
+  timeToFullMin: number | null;
+  etaLabel: string;
+  startPercent: number;
+  currentPercent: number;
+}
+
+const EMPTY_CHARGE_SPEED: ChargeSpeed = {
+  currentRateW: 0,
+  maxRateW: 0,
+  avgRateW: 0,
+  timeToFullMin: null,
+  etaLabel: '',
+  startPercent: 0,
+  currentPercent: 0,
+};
+
+export async function getChargeSpeed(): Promise<ChargeSpeed> {
+  return safe('get_charge_speed', EMPTY_CHARGE_SPEED);
+}
+
+// ─── Charge habits ─────────────────────────────────────────────────────
+
+export interface ChargeHabitMetrics {
+  avgMaxCharge: number;
+  overchargePct: number;
+  deepDischargePct: number;
+  timeAt100Minutes: number;
+  chargesTo100: number;
+  dischargesBelow20: number;
+}
+
+export interface ChargeHabits {
+  score: number;
+  verdict: string;
+  hasEnoughData: boolean;
+  isProvisional: boolean;
+  dataDays: number;
+  metrics: ChargeHabitMetrics;
+  tips: string[];
+}
+
+const EMPTY_CHARGE_HABITS: ChargeHabits = {
+  score: 0,
+  verdict: '',
+  hasEnoughData: false,
+  isProvisional: true,
+  dataDays: 0,
+  metrics: {
+    avgMaxCharge: 0,
+    overchargePct: 0,
+    deepDischargePct: 0,
+    timeAt100Minutes: 0,
+    chargesTo100: 0,
+    dischargesBelow20: 0,
+  },
+  tips: [],
+};
+
+export async function getChargeHabits(): Promise<ChargeHabits> {
+  return safe('get_charge_habits', EMPTY_CHARGE_HABITS);
+}
+
+// ─── Data retention ────────────────────────────────────────────────────
+
+export async function setDataRetention(days: number): Promise<void> {
+  return safe('set_data_retention', undefined, { days });
+}
+
+// ─── Export ────────────────────────────────────────────────────────────
+
+export async function exportReportJson(): Promise<string> {
+  return safe('export_report_json', 'error');
+}
+
+export async function exportReportPdf(): Promise<string> {
+  return safe('export_report_pdf', 'error');
+}
+
+// ─── "Before I unplug" estimate ────────────────────────────────────────
+
+export interface UnplugDrainEntry {
+  name: string;
+  watts: number;
+  estHours: number;
+}
+
+export interface UnplugEstimate {
+  totalHours: number;
+  totalLabel: string;
+  topDrains: UnplugDrainEntry[];
+  systemOverheadW: number;
+}
+
+const EMPTY_UNPLUG: UnplugEstimate = {
+  totalHours: 0,
+  totalLabel: '',
+  topDrains: [],
+  systemOverheadW: 0,
+};
+
+export async function getUnplugEstimate(): Promise<UnplugEstimate> {
+  return safe('get_unplug_estimate', EMPTY_UNPLUG);
+}
+
+// ─── Power plan auto-switching ──────────────────────────────────────────
+
+export interface PowerPlanStatus {
+  enabled: boolean;
+  lowThreshold: number;
+  highThreshold: number;
+  activeScheme: string;
+}
+
+export async function getPowerPlanStatus(): Promise<PowerPlanStatus> {
+  return safe('get_power_plan_status', {
+    enabled: false,
+    lowThreshold: 30,
+    highThreshold: 80,
+    activeScheme: 'unknown',
+  });
+}
+
+export async function setPowerPlanConfig(
+  enabled: boolean,
+  low: number,
+  high: number,
+): Promise<void> {
+  return safe('set_power_plan_config', undefined, { enabled, low, high });
 }
 
 // ─── Notification preferences ───────────────────────────────────────────

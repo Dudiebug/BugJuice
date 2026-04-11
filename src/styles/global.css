@@ -392,6 +392,7 @@ textarea {
   flex-direction: column;
   gap: 2px;
   min-width: 0;
+  flex: 1;
 }
 
 .power-row-name {

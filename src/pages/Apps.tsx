@@ -38,6 +38,7 @@ export function Apps() {
   }, [apps, query, sortKey]);
 
   const confidence = response?.confidencePercent ?? 0;
+  const systemOverhead = response?.systemOverheadW ?? 0;
   const hogs = apps.filter((a) => a.hog).length;
 
   return (
@@ -152,6 +153,54 @@ export function Apps() {
           {filtered.map((app, i) => (
             <AppRow key={app.pid} app={app} rank={i + 1} />
           ))}
+          {/* System overhead row */}
+          {systemOverhead > 0.1 && !query && (
+            <div
+              style={{
+                display: 'grid',
+                gridTemplateColumns: '40px 1fr 90px 90px 90px 80px',
+                padding: '12px 20px',
+                borderBottom: '1px solid var(--border)',
+                alignItems: 'center',
+                fontSize: 14,
+                color: 'var(--text-muted)',
+                background: 'var(--bg-inset)',
+              }}
+            >
+              <div
+                style={{
+                  width: 28,
+                  height: 28,
+                  borderRadius: 6,
+                  background: 'var(--bg-inset)',
+                  display: 'flex',
+                  alignItems: 'center',
+                  justifyContent: 'center',
+                  fontSize: 11,
+                }}
+              >
+                SYS
+              </div>
+              <div>
+                <div style={{ fontWeight: 500 }}>System / platform</div>
+                <div style={{ fontSize: 12 }}>
+                  display, memory, voltage regulators, always-on hardware
+                </div>
+              </div>
+              <div style={{ textAlign: 'right' }}>—</div>
+              <div style={{ textAlign: 'right' }}>—</div>
+              <div
+                style={{
+                  textAlign: 'right',
+                  fontWeight: 600,
+                  fontVariantNumeric: 'tabular-nums',
+                }}
+              >
+                {systemOverhead.toFixed(2)}
+              </div>
+              <div></div>
+            </div>
+          )}
           {filtered.length === 0 && (
             <div
               style={{

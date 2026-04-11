@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 
 /**
  * Run an async loader on a polling interval and return the latest value.
@@ -14,11 +14,16 @@ export function useApi<T>(
 ): T | null {
   const [value, setValue] = useState<T | null>(null);
 
+  // Keep the latest loader in a ref so the effect always calls the
+  // current version without needing it in the dependency array.
+  const loaderRef = useRef(loader);
+  loaderRef.current = loader;
+
   useEffect(() => {
     let cancelled = false;
     const tick = async () => {
       try {
-        const v = await loader();
+        const v = await loaderRef.current();
         if (!cancelled) setValue(v);
       } catch (e) {
         if (!cancelled) console.error('useApi loader failed:', e);
@@ -30,7 +35,6 @@ export function useApi<T>(
       cancelled = true;
       clearInterval(id);
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [intervalMs]);
 
   return value;

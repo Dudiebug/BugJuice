@@ -4,7 +4,7 @@
 // sensors / readings / battery_sessions / sleep_sessions / app_power /
 // health_snapshots / hourly_stats / daily_stats. For the prototype we
 // keep everything in a single .db file at %LOCALAPPDATA%\BugJuice\bugjuice.db
-// (monthly partitioning comes in Phase 2).
+// with time-based pruning to control database size.
 //
 // Concurrency model per the scope doc:
 //   - One dedicated writer.
@@ -18,7 +18,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use rusqlite::{Connection, OptionalExtension, Result as SqlResult, params};
 
-use crate::battery::{BATTERY_UNKNOWN_CAPACITY, BatterySnapshot};
+use crate::battery::{BATTERY_UNKNOWN_CAPACITY, BATTERY_UNKNOWN_VOLTAGE, BatterySnapshot};
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 
@@ -159,6 +159,11 @@ impl Storage {
             conn: Mutex::new(conn),
             session_id: Mutex::new(0),
         })
+    }
+
+    /// Current battery session id.
+    pub fn current_session_id(&self) -> i64 {
+        *self.session_id.lock().unwrap()
     }
 
     // ── Sensors ───────────────────────────────────────────────────────────────
@@ -402,7 +407,7 @@ impl Storage {
             let full = snap.info.full_charged_capacity as f64;
             ((1.0 - full / design) * 100.0).max(0.0)
         };
-        let voltage = if snap.status.voltage != BATTERY_UNKNOWN_CAPACITY {
+        let voltage = if snap.status.voltage != BATTERY_UNKNOWN_VOLTAGE {
             Some(snap.status.voltage as i64)
         } else {
             None
@@ -512,7 +517,7 @@ impl Storage {
             return Ok(Vec::new());
         };
         let mut stmt = conn.prepare(
-            "SELECT process_name, cpu_watts, gpu_watts, total_watts
+            "SELECT process_name, cpu_watts, gpu_watts, disk_watts, net_watts, total_watts
              FROM app_power
              WHERE ts = ?
              ORDER BY total_watts DESC",
@@ -523,12 +528,29 @@ impl Storage {
                     process_name: r.get(0)?,
                     cpu_watts: r.get::<_, Option<f64>>(1)?.unwrap_or(0.0),
                     gpu_watts: r.get::<_, Option<f64>>(2)?.unwrap_or(0.0),
-                    total_watts: r.get::<_, Option<f64>>(3)?.unwrap_or(0.0),
+                    disk_watts: r.get::<_, Option<f64>>(3)?.unwrap_or(0.0),
+                    net_watts: r.get::<_, Option<f64>>(4)?.unwrap_or(0.0),
+                    total_watts: r.get::<_, Option<f64>>(5)?.unwrap_or(0.0),
                 })
             })?
             .filter_map(|r| r.ok())
             .collect();
         Ok(v)
+    }
+
+    /// Max and average positive charge rate for a given session.
+    /// Returns (max_rate_w, avg_rate_w). Only considers readings where value > 0.
+    pub fn read_session_charge_stats(&self, session_id: i64) -> SqlResult<(f64, f64)> {
+        let conn = self.conn.lock().unwrap();
+        let (max_r, avg_r): (f64, f64) = conn
+            .query_row(
+                "SELECT COALESCE(MAX(r.value), 0), COALESCE(AVG(r.value), 0)
+                 FROM readings r JOIN sensors s ON r.sensor_id = s.sensor_id
+                 WHERE s.name = 'battery_rate' AND r.session_id = ? AND r.value > 0",
+                params![session_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )?;
+        Ok((max_r, avg_r))
     }
 
     /// All battery sessions, newest first.
@@ -820,11 +842,12 @@ impl Storage {
             "SELECT process_name,
                     AVG(COALESCE(total_watts, 0)) as avg_watts,
                     MAX(COALESCE(total_watts, 0)) as max_watts,
-                    COUNT(*) as sample_count
+                    COUNT(*) as sample_count,
+                    SUM(COALESCE(total_watts, 0)) as total_energy
              FROM app_power
              WHERE ts >= ?1 AND ts < ?2
              GROUP BY process_name
-             ORDER BY avg_watts DESC
+             ORDER BY total_energy DESC
              LIMIT 20",
         )?;
         let rows = stmt.query_map(rusqlite::params![start_ts, end_ts], |row| {
@@ -833,9 +856,93 @@ impl Storage {
                 avg_watts: row.get(1)?,
                 max_watts: row.get(2)?,
                 sample_count: row.get(3)?,
+                total_energy: row.get(4)?,
             })
         })?;
         rows.collect()
+    }
+
+    // ── Charge habit analysis ──────────────────────────────────────────────────
+
+    /// Gather charge/discharge session stats and time-at-100% readings for
+    /// the lookback window starting at `since_ts`.
+    pub fn read_charge_habit_data(&self, since_ts: i64) -> SqlResult<ChargeHabitData> {
+        let conn = self.conn.lock().unwrap();
+
+        // Charge sessions (on_ac = 1, completed)
+        let (charge_count, avg_end_pct, above_80, to_100): (i64, f64, i64, i64) = conn
+            .query_row(
+                "SELECT COUNT(*),
+                        COALESCE(AVG(end_percent), 0),
+                        COALESCE(SUM(CASE WHEN end_percent > 80 THEN 1 ELSE 0 END), 0),
+                        COALESCE(SUM(CASE WHEN end_percent >= 99 THEN 1 ELSE 0 END), 0)
+                 FROM battery_sessions
+                 WHERE on_ac = 1 AND ended_at IS NOT NULL AND started_at >= ?",
+                params![since_ts],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )?;
+
+        // Discharge sessions (on_ac = 0, completed)
+        let (discharge_count, below_20, below_10, avg_depth): (i64, i64, i64, f64) = conn
+            .query_row(
+                "SELECT COUNT(*),
+                        COALESCE(SUM(CASE WHEN end_percent < 20 THEN 1 ELSE 0 END), 0),
+                        COALESCE(SUM(CASE WHEN end_percent < 10 THEN 1 ELSE 0 END), 0),
+                        COALESCE(AVG(start_percent - COALESCE(end_percent, start_percent)), 0)
+                 FROM battery_sessions
+                 WHERE on_ac = 0 AND ended_at IS NOT NULL AND started_at >= ?",
+                params![since_ts],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )?;
+
+        // Approximate seconds spent at 100%: count ticks where battery_percent ≥ 99,
+        // then multiply by typical tick interval (~10s).
+        let ticks_at_100: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM readings r
+                 JOIN sensors s ON r.sensor_id = s.sensor_id
+                 WHERE s.name = 'battery_percent' AND r.value >= 99.0 AND r.ts >= ?",
+                params![since_ts],
+                |r| r.get(0),
+            )?;
+
+        // Time span
+        let (oldest, newest): (Option<i64>, Option<i64>) = conn
+            .query_row(
+                "SELECT MIN(started_at), MAX(COALESCE(ended_at, started_at))
+                 FROM battery_sessions
+                 WHERE started_at >= ? AND ended_at IS NOT NULL",
+                params![since_ts],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )?;
+
+        Ok(ChargeHabitData {
+            charge_sessions: charge_count,
+            avg_max_soc: avg_end_pct,
+            charges_above_80: above_80,
+            charges_to_100: to_100,
+            discharge_sessions: discharge_count,
+            discharges_below_20: below_20,
+            discharges_below_10: below_10,
+            avg_discharge_depth: avg_depth,
+            time_at_100_secs: ticks_at_100 * 10, // ~10s per tick
+            oldest_ts: oldest,
+            newest_ts: newest,
+        })
+    }
+
+    // ── Data pruning ─────────────────────────────────────────────────────────
+
+    /// Delete readings and app_power rows older than `retention_days`.
+    /// Returns (readings_deleted, app_power_deleted).
+    pub fn prune_old_data(&self, retention_days: u32) -> SqlResult<(usize, usize)> {
+        let conn = self.conn.lock().unwrap();
+        let cutoff = now_unix() - (retention_days as i64 * 86400);
+        let r1 = conn.execute("DELETE FROM readings WHERE ts < ?", params![cutoff])?;
+        let r2 = conn.execute("DELETE FROM app_power WHERE ts < ?", params![cutoff])?;
+        // Reclaim free pages without rebuilding the entire DB.
+        let _ = conn.execute_batch("PRAGMA incremental_vacuum(1000);");
+        Ok((r1, r2))
     }
 
     /// Per-power-channel readings within an absolute time range. Returns
@@ -914,6 +1021,8 @@ pub struct AppPowerReadRow {
     pub process_name: String,
     pub cpu_watts: f64,
     pub gpu_watts: f64,
+    pub disk_watts: f64,
+    pub net_watts: f64,
     pub total_watts: f64,
 }
 
@@ -960,6 +1069,9 @@ pub struct AppPowerSummaryRow {
     pub avg_watts: f64,
     pub max_watts: f64,
     pub sample_count: i64,
+    /// Sum of all instantaneous watts across all samples — proportional to
+    /// total energy (watt-hours) consumed. Use for "% of battery drain".
+    pub total_energy: f64,
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -977,4 +1089,19 @@ fn normalize_capacity(cap: u32) -> Option<u32> {
     } else {
         Some(cap)
     }
+}
+
+#[derive(Debug, Clone)]
+pub struct ChargeHabitData {
+    pub charge_sessions: i64,
+    pub avg_max_soc: f64,
+    pub charges_above_80: i64,
+    pub charges_to_100: i64,
+    pub discharge_sessions: i64,
+    pub discharges_below_20: i64,
+    pub discharges_below_10: i64,
+    pub avg_discharge_depth: f64,
+    pub time_at_100_secs: i64,
+    pub oldest_ts: Option<i64>,
+    pub newest_ts: Option<i64>,
 }

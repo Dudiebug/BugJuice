@@ -1,7 +1,7 @@
 {
   "$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
   "productName": "BugJuice",
-  "version": "0.1.0",
+  "version": "0.4.0-beta",
   "identifier": "com.dudiebug.bugjuice",
   "build": {
     "frontendDist": "../dist",
@@ -21,16 +21,26 @@
         "fullscreen": false,
         "decorations": true,
         "transparent": false,
-        "center": true
+        "center": true,
+        "visible": false
       }
     ],
     "security": {
       "csp": null
     }
   },
+  "plugins": {
+    "updater": {
+      "endpoints": [
+        "https://github.com/Dudiebug/BugJuice/releases/latest/download/latest.json"
+      ],
+      "pubkey": "REPLACE_WITH_ED25519_PUBLIC_KEY"
+    }
+  },
   "bundle": {
     "active": true,
     "targets": ["nsis"],
+    "resources": ["bugjuice-svc.exe"],
     "publisher": "DudieBug",
     "category": "Utility",
     "shortDescription": "Battery monitoring and analytics for Windows",
@@ -44,7 +54,8 @@
     ],
     "windows": {
       "nsis": {
-        "installMode": "currentUser",
+        "installMode": "perMachine",
+        "installerHooks": "./nsis-hooks.nsi",
         "languages": ["English"],
         "displayLanguageSelector": false
       }

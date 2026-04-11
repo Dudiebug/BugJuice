@@ -3,18 +3,17 @@
   <assemblyIdentity
     type="win32"
     name="com.dudiebug.bugjuice"
-    version="0.1.0.0"
+    version="0.4.0.0"
     processorArchitecture="*"/>
   <trustInfo xmlns="urn:schemas-microsoft-com:asm.v3">
     <security>
       <requestedPrivileges>
         <!--
-          BugJuice needs admin to read EMI (Energy Meter Interface) on
-          Snapdragon X and other OEM platforms where the driver rejects
-          Medium integrity-level callers. Without this, per-channel
-          power readings come back as 0 W and the dashboard is useless.
+          asInvoker: the app no longer needs admin directly. EMI reads
+          are handled by the bugjuice-svc Windows service (runs as
+          SYSTEM). The app talks to the service over a named pipe.
         -->
-        <requestedExecutionLevel level="requireAdministrator" uiAccess="false"/>
+        <requestedExecutionLevel level="asInvoker" uiAccess="false"/>
       </requestedPrivileges>
     </security>
   </trustInfo>

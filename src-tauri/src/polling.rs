@@ -19,7 +19,7 @@ use std::time::{Duration, Instant};
 
 use crate::battery::{
     self, BATTERY_CHARGING, BATTERY_DISCHARGING, BATTERY_POWER_ON_LINE, BATTERY_UNKNOWN_CAPACITY,
-    BATTERY_UNKNOWN_RATE,
+    BATTERY_UNKNOWN_RATE, BATTERY_UNKNOWN_VOLTAGE,
 };
 
 static LAST_BATTERY_RATE_W: AtomicU64 = AtomicU64::new(0);
@@ -28,9 +28,9 @@ pub fn last_battery_rate_w() -> f64 {
     f64::from_bits(LAST_BATTERY_RATE_W.load(AtomicOrdering::Relaxed))
 }
 use crate::events;
-use crate::gpu::GpuQuery;
+use crate::gpu::{GpuQuery, NvmlPower};
 use crate::power;
-use crate::processes::{self, ProcessSample, ProcessorTotals};
+use crate::processes::{self, ProcessEnergySnapshot, ProcessSample, ProcessorTotals};
 use crate::storage::{self, AppPowerRow, ReadingInput};
 
 /// Debounce window: an AC/DC change must hold for this long before the
@@ -46,6 +46,9 @@ struct PollState {
     /// PDH-based GPU utilization query, held across ticks so each sample
     /// reports the delta since the previous collect.
     gpu: Option<GpuQuery>,
+    /// NVML power reader for NVIDIA discrete GPUs. Used as a fallback when
+    /// EMI doesn't expose a GPU power channel.
+    nvml: Option<NvmlPower>,
     /// Power state that's been committed to the database as the current
     /// battery session. None on startup.
     committed_on_ac: Option<bool>,
@@ -53,11 +56,14 @@ struct PollState {
     /// it holds long enough to be the new committed state.
     pending_transition: Option<(bool, Instant)>,
     /// Whether the charge-limit notification has already been sent this
-    /// charge cycle (reset when percent drops below threshold - 2%).
+    /// charge cycle (reset when percent drops below threshold - 2%,
+    /// or when the user changes the threshold in Settings).
     charge_limit_notified: bool,
-    /// Whether the low-battery notification has already been sent this
-    /// discharge cycle (reset when percent rises above threshold + 2%).
     low_battery_notified: bool,
+    /// Track the last-seen threshold values so we can reset the debounce
+    /// flags when the user changes them in Settings.
+    last_charge_limit: f64,
+    last_low_threshold: f64,
     /// Timestamp (unix secs) of the last periodic summary notification.
     last_summary_ts: i64,
     /// Battery percent when the last summary was sent (for delta calc).
@@ -66,23 +72,50 @@ struct PollState {
     last_aggregated_hour: i64,
     /// Last day boundary at which we aggregated hourly_stats into daily_stats.
     last_aggregated_day: i64,
+    /// When old readings/app_power were last pruned.
+    last_prune: Instant,
+    /// Previous battery capacity and timestamp, used to compute a fallback
+    /// rate when the IOCTL returns BATTERY_UNKNOWN_RATE (e.g., some HP laptops).
+    prev_capacity_mwh: Option<u32>,
+    prev_capacity_ts: Option<Instant>,
+    /// Previous per-process energy snapshots for delta computation.
+    prev_energy: Option<std::collections::HashMap<u32, ProcessEnergySnapshot>>,
+    prev_energy_ts: Option<Instant>,
+    /// LibreHardwareMonitor WMI reader state (x64 only).
+    lhm: crate::lhm::LhmState,
+    /// Measured idle system power in watts. None until first measurement.
+    idle_baseline_w: Option<f64>,
+    /// Samples collected during low-activity periods for idle baseline.
+    idle_samples: Vec<f64>,
 }
 
 impl PollState {
     fn new() -> Self {
         Self {
-            last_health: Instant::now() - Duration::from_secs(3600),
+            last_health: Instant::now().checked_sub(Duration::from_secs(3600)).unwrap_or(Instant::now()),
             prev_processes: None,
             prev_cpu_totals: None,
             gpu: GpuQuery::new(),
+            nvml: NvmlPower::new(),
             committed_on_ac: None,
             pending_transition: None,
             charge_limit_notified: false,
             low_battery_notified: false,
+            last_charge_limit: 0.0,
+            last_low_threshold: 0.0,
             last_summary_ts: 0,
             summary_start_percent: None,
             last_aggregated_hour: 0,
             last_aggregated_day: 0,
+            // Set far in the past so the first tick triggers a prune.
+            last_prune: Instant::now().checked_sub(Duration::from_secs(86400 * 2)).unwrap_or(Instant::now()),
+            prev_capacity_mwh: None,
+            prev_capacity_ts: None,
+            lhm: crate::lhm::LhmState::new(),
+            prev_energy: None,
+            prev_energy_ts: None,
+            idle_baseline_w: None,
+            idle_samples: Vec::new(),
         }
     }
 
@@ -165,6 +198,43 @@ fn tick(state: &mut PollState) {
         state.pending_transition = None;
     }
 
+    // ── Computed rate fallback ─────────────────────────────────────────────
+    // On hardware that returns BATTERY_UNKNOWN_RATE (e.g., some HP laptops),
+    // estimate the rate from the capacity delta between successive polls.
+    // Only used as a fallback — the actual IOCTL rate is always preferred.
+    let computed_rate_w: Option<f64> = if snap.status.rate == BATTERY_UNKNOWN_RATE
+        && snap.status.capacity != BATTERY_UNKNOWN_CAPACITY
+    {
+        match (state.prev_capacity_mwh, state.prev_capacity_ts) {
+            (Some(prev_cap), Some(prev_ts)) => {
+                let elapsed = prev_ts.elapsed().as_secs_f64();
+                if elapsed >= 5.0 {
+                    let delta = snap.status.capacity as f64 - prev_cap as f64;
+                    Some(delta * 3.6 / elapsed) // mWh delta → watts
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
+    } else {
+        None
+    };
+    // Advance the capacity baseline when we've computed a rate (or first
+    // reading to establish baseline). When IOCTL provides a real rate,
+    // always track so we have a baseline ready if it stops reporting.
+    if snap.status.capacity != BATTERY_UNKNOWN_CAPACITY {
+        let advance = if snap.status.rate == BATTERY_UNKNOWN_RATE {
+            state.prev_capacity_mwh.is_none() || computed_rate_w.is_some()
+        } else {
+            true
+        };
+        if advance {
+            state.prev_capacity_mwh = Some(snap.status.capacity);
+            state.prev_capacity_ts = Some(Instant::now());
+        }
+    }
+
     // Build the full batch of readings for this tick, then insert in one
     // transaction (single fsync) to keep disk I/O minimal.
     let mut batch: Vec<ReadingInput> = Vec::with_capacity(16);
@@ -188,7 +258,7 @@ fn tick(state: &mut PollState) {
             value: snap.status.capacity as f64,
         });
     }
-    if snap.status.voltage != BATTERY_UNKNOWN_CAPACITY {
+    if snap.status.voltage != BATTERY_UNKNOWN_VOLTAGE {
         batch.push(ReadingInput {
             name: "battery_voltage".into(),
             unit: "V",
@@ -205,14 +275,23 @@ fn tick(state: &mut PollState) {
             hw_source: Some("ioctl"),
             value: snap.status.rate as f64 / 1000.0,
         });
+    } else if let Some(rate) = computed_rate_w {
+        batch.push(ReadingInput {
+            name: "battery_rate".into(),
+            unit: "W",
+            category: "battery",
+            hw_source: Some("computed"),
+            value: rate,
+        });
     }
 
-    // Power channels via EMI. Read directly — same code path as the CLI.
-    // Pick out CPU package and GPU totals for the per-process attribution
-    // below.
+    // Power channels via the bugjuice-service named pipe. The service runs
+    // as SYSTEM and reads EMI devices that require elevation. If the service
+    // isn't running, read_emi() returns an empty vec — we just skip power
+    // channels and the rest of the app (battery, CPU, GPU) still works.
     let mut cpu_package_watts: Option<f64> = None;
     let mut gpu_package_watts: Option<f64> = None;
-    if let Ok(readings) = power::read_all_emi(Duration::from_secs(1)) {
+    if let Ok(readings) = crate::pipe_client::read_emi() {
         for r in readings {
             for ch in &r.channels {
                 batch.push(ReadingInput {
@@ -228,14 +307,26 @@ fn tick(state: &mut PollState) {
                     gpu_package_watts = Some(ch.watts);
                 }
             }
-            // CPU package: prefer Intel-style PKG if present, else sum
-            // Snapdragon-style CPU_CLUSTER_* channels.
-            if let Some(pkg) = r
+            // CPU core power: prefer PP0 (cores-only) over PKG (cores + uncore + iGPU).
+            // PKG over-attributes because it includes memory controller, system agent,
+            // and ring bus power that no individual process caused.
+            if let Some(pp0) = r
+                .channels
+                .iter()
+                .find(|c| {
+                    let u = c.name.to_ascii_uppercase();
+                    u.contains("PP0") || u == "CORE"
+                })
+            {
+                cpu_package_watts = Some(pp0.watts);
+            } else if let Some(pkg) = r
                 .channels
                 .iter()
                 .find(|c| c.name.to_ascii_uppercase().contains("PKG"))
             {
-                cpu_package_watts = Some(pkg.watts);
+                // Fallback: PKG minus PP1 (iGPU) as approximate cores-only.
+                let pp1 = gpu_package_watts.unwrap_or(0.0);
+                cpu_package_watts = Some((pkg.watts - pp1).max(0.0));
             } else {
                 let cluster_sum: f64 = r
                     .channels
@@ -250,17 +341,55 @@ fn tick(state: &mut PollState) {
         }
     }
 
+    // If EMI didn't provide GPU watts, try NVML (NVIDIA discrete GPUs).
+    if gpu_package_watts.is_none() {
+        if let Some(ref nvml) = state.nvml {
+            gpu_package_watts = nvml.read_total_watts();
+        }
+    }
+
+    // ── LibreHardwareMonitor supplement (x64 only) ──────────────────────────
+    // If LHM is running, use its RAPL readings to fill gaps EMI didn't cover.
+    if let Some(lhm_data) = crate::lhm::read_power(&mut state.lhm) {
+        if cpu_package_watts.is_none() {
+            if let Some(w) = lhm_data.cpu_cores_w.or(lhm_data.cpu_package_w) {
+                cpu_package_watts = Some(w);
+                batch.push(ReadingInput {
+                    name: "power_lhm_cpu".into(),
+                    unit: "W",
+                    category: "power",
+                    hw_source: Some("lhm"),
+                    value: w,
+                });
+            }
+        }
+        if gpu_package_watts.is_none() {
+            if let Some(w) = lhm_data.gpu_power_w {
+                gpu_package_watts = Some(w);
+                batch.push(ReadingInput {
+                    name: "power_lhm_gpu".into(),
+                    unit: "W",
+                    category: "power",
+                    hw_source: Some("lhm"),
+                    value: w,
+                });
+            }
+        }
+    }
+
     let _ = storage.log_readings_batch(&batch);
 
     // ── Per-process CPU + GPU power attribution ─────────────────────────────
     log_app_power(state, storage, cpu_package_watts, gpu_package_watts);
 
-    // ── Store battery rate for confidence score ──────────────────────────────
+    // ── Store battery rate for confidence score + command fallback ──────────
     if snap.status.rate != BATTERY_UNKNOWN_RATE {
         LAST_BATTERY_RATE_W.store(
             (snap.status.rate as f64 / 1000.0).to_bits(),
             AtomicOrdering::Relaxed,
         );
+    } else if let Some(rate) = computed_rate_w {
+        LAST_BATTERY_RATE_W.store(rate.to_bits(), AtomicOrdering::Relaxed);
     }
 
     // ── Tray tooltip + menu info update ────────────────────────────────────
@@ -278,9 +407,11 @@ fn tick(state: &mut PollState) {
             // Build info-item texts from the battery snapshot.
             let charging = snap.status.power_state & BATTERY_CHARGING != 0;
             let discharging = snap.status.power_state & BATTERY_DISCHARGING != 0;
-            let rate_known = snap.status.rate != BATTERY_UNKNOWN_RATE;
-            let rate_w = if rate_known {
+            let rate_known = snap.status.rate != BATTERY_UNKNOWN_RATE || computed_rate_w.is_some();
+            let rate_w = if snap.status.rate != BATTERY_UNKNOWN_RATE {
                 snap.status.rate.unsigned_abs() as f64 / 1000.0
+            } else if let Some(rate) = computed_rate_w {
+                rate.abs()
             } else {
                 0.0
             };
@@ -331,8 +462,27 @@ fn tick(state: &mut PollState) {
     // ── Notification checks ──────────────────────────────────────────────────
     check_notifications(state, snap, on_ac);
 
+    // ── Power plan auto-switching ───────────────────────────────────────────
+    {
+        let pct = if snap.status.capacity != BATTERY_UNKNOWN_CAPACITY
+            && snap.info.full_charged_capacity > 0
+        {
+            snap.status.capacity as f64 / snap.info.full_charged_capacity as f64 * 100.0
+        } else {
+            50.0 // safe default — won't trigger thresholds
+        };
+        crate::power_plan::auto_switch(pct, on_ac);
+    }
+
     // ── Tiered aggregation ───────────────────────────────────────────────────
     check_aggregation(state, storage);
+
+    // ── Data pruning (once every 24h) ───────────────────────────────────────
+    if state.last_prune.elapsed() >= Duration::from_secs(86400) {
+        let days = crate::commands::data_retention_days();
+        let _ = storage.prune_old_data(days);
+        state.last_prune = Instant::now();
+    }
 
     // ── Periodic health snapshot ─────────────────────────────────────────────
     if state.last_health.elapsed() >= Duration::from_secs(60) {
@@ -342,8 +492,16 @@ fn tick(state: &mut PollState) {
 }
 
 /// Take a process + GPU snapshot, diff against the previous, attribute
-/// the measured CPU and GPU package wattage proportionally, and write
-/// rows to app_power. Skips the very first tick (no baseline yet).
+/// power proportionally, and write rows to app_power.
+///
+/// Attribution strategy (in priority order):
+///   1. ProcessEnergyValues (Windows E3) — energy deltas as relative weights
+///   2. Fallback: CPU time share × PP0 watts (if energy API unavailable)
+///
+/// GPU: PDH utilization × measured GPU watts (EMI or NVML), idle subtracted.
+/// Disk/network: energy deltas as relative weights, scaled to estimated component power.
+///
+/// All per-process values are capped so the sum never exceeds battery discharge.
 fn log_app_power(
     state: &mut PollState,
     storage: &storage::Storage,
@@ -366,52 +524,153 @@ fn log_app_power(
         .map(|g| g.sample())
         .unwrap_or_default();
 
+    // ── Idle baseline collection ────────────────────────────────────────
+    // During low-activity periods, sample battery rate to estimate idle power.
+    if state.idle_baseline_w.is_none() {
+        if let (Some(prev_totals), Some(_)) =
+            (state.prev_cpu_totals.as_ref(), state.prev_processes.as_ref())
+        {
+            let idle_frac = processes::idle_fraction(prev_totals, &curr_totals);
+            let battery_w = last_battery_rate_w();
+            // Only sample when system is mostly idle and on battery (negative rate).
+            if idle_frac > 0.90 && battery_w < -0.5 {
+                state.idle_samples.push(battery_w.abs());
+                if state.idle_samples.len() >= 5 {
+                    // Use median to be robust against transient spikes.
+                    state.idle_samples.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                    state.idle_baseline_w = Some(state.idle_samples[state.idle_samples.len() / 2]);
+                    log::info!(
+                        "idle baseline measured: {:.1}W ({} samples)",
+                        state.idle_baseline_w.unwrap(),
+                        state.idle_samples.len()
+                    );
+                }
+            }
+        }
+    }
+
+    // ── Energy snapshot for ProcessEnergyValues ─────────────────────────
+    let pids: Vec<u32> = curr_procs.iter().map(|p| p.pid).collect();
+    let curr_energy = processes::snapshot_energy_values(&pids);
+    let now = Instant::now();
+
+    // Build PID → name lookup.
+    let pid_names: std::collections::HashMap<u32, String> = curr_procs
+        .iter()
+        .map(|p| (p.pid, p.name.clone()))
+        .collect();
+
     if let (Some(prev_procs), Some(prev_totals)) =
         (state.prev_processes.as_ref(), state.prev_cpu_totals.as_ref())
     {
-        let deltas = processes::compute_deltas(prev_procs, &curr_procs, prev_totals, &curr_totals);
+        let use_energy_api = processes::energy_api_available()
+            && state.prev_energy.is_some()
+            && !curr_energy.is_empty();
 
-        // We want to log anything with CPU *or* GPU activity. Start with
-        // the CPU-sorted top 50, then fold in any GPU-using PIDs we might
-        // have missed.
-        let mut seen_pids: std::collections::HashSet<u32> = std::collections::HashSet::new();
+        let battery_w = last_battery_rate_w();
+        let idle_w = state.idle_baseline_w.unwrap_or(3.0); // conservative default
+        let dynamic_budget = if battery_w < -0.5 {
+            (battery_w.abs() - idle_w).max(0.5)
+        } else {
+            // On AC: no battery constraint, use measured component totals.
+            cpu_package_watts.unwrap_or(0.0) + gpu_package_watts.unwrap_or(0.0) + 2.0
+        };
+
         let mut rows: Vec<AppPowerRow> = Vec::with_capacity(64);
+        let mut seen_pids: std::collections::HashSet<u32> = std::collections::HashSet::new();
 
-        for d in deltas.iter().take(50) {
-            seen_pids.insert(d.pid);
-            let cpu_w = cpu_package_watts.map(|w| d.share * w);
-            // GPU watts = (process_percent / 100) × GPU package watts.
-            // Clamp the fraction at 1.0 — parallel engines can push the
-            // raw sum above 100%, but the physical GPU chip isn't doing
-            // more work than it's drawing power for.
-            let gpu_pct = gpu_map.get(&d.pid).copied().unwrap_or(0.0);
-            let gpu_frac = (gpu_pct / 100.0).clamp(0.0, 1.0);
-            let gpu_w = gpu_package_watts.map(|w| gpu_frac * w);
+        if use_energy_api {
+            // ── Energy-based attribution (preferred) ────────────────────
+            let prev_e = state.prev_energy.as_ref().unwrap();
+            let energy_deltas =
+                processes::compute_energy_deltas(prev_e, &curr_energy, &pid_names);
 
-            let total_w = match (cpu_w, gpu_w) {
-                (Some(c), Some(g)) => Some(c + g),
-                (Some(c), None) => Some(c),
-                (None, Some(g)) => Some(g),
-                _ => None,
-            };
+            let total_cpu_cycles: u64 = energy_deltas.iter().map(|d| d.cpu_cycles_delta).sum();
+            let total_disk_energy: u64 = energy_deltas.iter().map(|d| d.disk_energy_delta).sum();
+            let total_net_energy: u64 = energy_deltas.iter().map(|d| d.network_energy_delta).sum();
 
-            rows.push(AppPowerRow {
-                process_name: d.name.clone(),
-                cpu_watts: cpu_w,
-                gpu_watts: gpu_w,
-                disk_watts: None,
-                net_watts: None,
-                total_watts: total_w,
-            });
+            let cpu_total_w = cpu_package_watts.unwrap_or(0.0);
+            // Estimate disk ~2W and network ~1W when active.
+            let disk_total_w = if total_disk_energy > 0 { 2.0 } else { 0.0 };
+            let net_total_w = if total_net_energy > 0 { 1.0 } else { 0.0 };
+
+            for d in energy_deltas.iter().take(80) {
+                seen_pids.insert(d.pid);
+
+                // CPU: energy cycle share × measured CPU watts.
+                let cpu_share = if total_cpu_cycles > 0 {
+                    d.cpu_cycles_delta as f64 / total_cpu_cycles as f64
+                } else {
+                    0.0
+                };
+                let cpu_w = cpu_share * cpu_total_w;
+
+                // GPU: still use PDH utilization × measured GPU power.
+                let gpu_pct = gpu_map.get(&d.pid).copied().unwrap_or(0.0);
+                let gpu_frac = (gpu_pct / 100.0).clamp(0.0, 1.0);
+                let gpu_w = gpu_package_watts.map(|w| gpu_frac * w);
+
+                // Disk: energy share × estimated disk power.
+                let disk_share = if total_disk_energy > 0 {
+                    d.disk_energy_delta as f64 / total_disk_energy as f64
+                } else {
+                    0.0
+                };
+                let disk_w = disk_share * disk_total_w;
+
+                // Network: energy share × estimated net power.
+                let net_share = if total_net_energy > 0 {
+                    d.network_energy_delta as f64 / total_net_energy as f64
+                } else {
+                    0.0
+                };
+                let net_w = net_share * net_total_w;
+
+                let total_w = cpu_w + gpu_w.unwrap_or(0.0) + disk_w + net_w;
+
+                rows.push(AppPowerRow {
+                    process_name: d.name.clone(),
+                    cpu_watts: Some(cpu_w),
+                    gpu_watts: gpu_w,
+                    disk_watts: if disk_w > 0.001 { Some(disk_w) } else { None },
+                    net_watts: if net_w > 0.001 { Some(net_w) } else { None },
+                    total_watts: Some(total_w),
+                });
+            }
+        } else {
+            // ── Fallback: CPU time share × PP0 watts ────────────────────
+            let deltas = processes::compute_deltas(prev_procs, &curr_procs, prev_totals, &curr_totals);
+
+            for d in deltas.iter().take(50) {
+                seen_pids.insert(d.pid);
+                let cpu_w = cpu_package_watts.map(|w| d.share * w);
+                let gpu_pct = gpu_map.get(&d.pid).copied().unwrap_or(0.0);
+                let gpu_frac = (gpu_pct / 100.0).clamp(0.0, 1.0);
+                let gpu_w = gpu_package_watts.map(|w| gpu_frac * w);
+
+                let total_w = match (cpu_w, gpu_w) {
+                    (Some(c), Some(g)) => Some(c + g),
+                    (Some(c), None) => Some(c),
+                    (None, Some(g)) => Some(g),
+                    _ => None,
+                };
+
+                rows.push(AppPowerRow {
+                    process_name: d.name.clone(),
+                    cpu_watts: cpu_w,
+                    gpu_watts: gpu_w,
+                    disk_watts: None,
+                    net_watts: None,
+                    total_watts: total_w,
+                });
+            }
         }
 
-        // Pick up GPU-only processes that aren't in the CPU top 50.
+        // Pick up GPU-only processes not already seen.
         for (&pid, &pct) in &gpu_map {
             if seen_pids.contains(&pid) || pct < 1.0 {
                 continue;
             }
-            // Use the name from the current process snapshot, if we can
-            // find it. Otherwise fall back to pid_NNNN.
             let name = curr_procs
                 .iter()
                 .find(|p| p.pid == pid)
@@ -429,11 +688,26 @@ fn log_app_power(
             });
         }
 
+        // ── Capping: scale down if sum exceeds dynamic budget ───────────
+        let raw_sum: f64 = rows.iter().filter_map(|r| r.total_watts).sum();
+        if raw_sum > dynamic_budget && raw_sum > 0.01 {
+            let scale = dynamic_budget / raw_sum;
+            for r in &mut rows {
+                r.cpu_watts = r.cpu_watts.map(|v| v * scale);
+                r.gpu_watts = r.gpu_watts.map(|v| v * scale);
+                r.disk_watts = r.disk_watts.map(|v| v * scale);
+                r.net_watts = r.net_watts.map(|v| v * scale);
+                r.total_watts = r.total_watts.map(|v| v * scale);
+            }
+        }
+
         let _ = storage.log_app_power_batch(&rows);
     }
 
     state.prev_processes = Some(curr_procs);
     state.prev_cpu_totals = Some(curr_totals);
+    state.prev_energy = Some(curr_energy);
+    state.prev_energy_ts = Some(now);
 }
 
 fn check_notifications(state: &mut PollState, snap: &battery::BatterySnapshot, on_ac: bool) {
@@ -444,7 +718,37 @@ fn check_notifications(state: &mut PollState, snap: &battery::BatterySnapshot, o
         return;
     };
 
-    // Charge limit
+    // Reset debounce flags when the user changes thresholds in Settings,
+    // so a new notification can fire at the new value.
+    if (prefs.charge_limit - state.last_charge_limit).abs() > 0.1 {
+        state.charge_limit_notified = false;
+        state.last_charge_limit = prefs.charge_limit;
+    }
+    if (prefs.low_threshold - state.last_low_threshold).abs() > 0.1 {
+        state.low_battery_notified = false;
+        state.last_low_threshold = prefs.low_threshold;
+    }
+
+    // On the very first tick (last_charge_limit was 0), just record the
+    // current thresholds without firing. This prevents a spurious
+    // notification on app startup when the battery is already above the
+    // limit. The notification will fire on the NEXT tick that crosses
+    // the threshold (i.e., when the battery actually reaches it).
+    if state.last_charge_limit == 0.0 && state.last_low_threshold == 0.0 {
+        state.last_charge_limit = prefs.charge_limit;
+        state.last_low_threshold = prefs.low_threshold;
+        // If already above charge limit on startup, mark as notified so
+        // we don't fire immediately — wait for a fresh crossing.
+        if on_ac && pct >= prefs.charge_limit {
+            state.charge_limit_notified = true;
+        }
+        if !on_ac && pct <= prefs.low_threshold {
+            state.low_battery_notified = true;
+        }
+        return;
+    }
+
+    // Charge limit: fire when battery crosses UP past the limit while charging
     if prefs.notify_charge && on_ac && pct >= prefs.charge_limit {
         if !state.charge_limit_notified {
             fire_notification(
@@ -457,7 +761,7 @@ fn check_notifications(state: &mut PollState, snap: &battery::BatterySnapshot, o
         state.charge_limit_notified = false;
     }
 
-    // Low battery
+    // Low battery: fire when battery drops BELOW the threshold while discharging
     if prefs.notify_low && !on_ac && pct <= prefs.low_threshold {
         if !state.low_battery_notified {
             fire_notification(
@@ -494,7 +798,7 @@ fn check_notifications(state: &mut PollState, snap: &battery::BatterySnapshot, o
             let rate_w = if snap.status.rate != BATTERY_UNKNOWN_RATE {
                 snap.status.rate as f64 / 1000.0
             } else {
-                0.0
+                last_battery_rate_w() // fallback to computed rate
             };
 
             let mut lines: Vec<String> = Vec::new();

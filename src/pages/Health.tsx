@@ -7,12 +7,13 @@ import {
   XAxis,
   YAxis,
 } from 'recharts';
-import { getBatteryStatus, getHealthHistory } from '@/api';
+import { getBatteryStatus, getChargeHabits, getHealthHistory } from '@/api';
 import { useApi } from '@/hooks/useApi';
 
 export function Health() {
   const status = useApi(getBatteryStatus, 30_000);
   const historyData = useApi(getHealthHistory, 60_000);
+  const habits = useApi(getChargeHabits, 60_000);
 
   if (!status) {
     return (
@@ -189,13 +190,106 @@ export function Health() {
       <section className="grid grid-2">
         <div className="card">
           <div className="card-title">Charge habits</div>
-          <p style={{ marginTop: 12, color: 'var(--text-subtle)', fontSize: 14 }}>
-            BugJuice will analyse your charge habits once it has collected a
-            few complete battery sessions. In the meantime, the generally
-            safe guidance for lithium-ion: keep the battery between{' '}
-            <strong>20%</strong> and <strong>80%</strong> most of the time,
-            and avoid leaving it at 100% for long periods.
-          </p>
+          {(!habits || !habits.hasEnoughData) ? (
+            <>
+              <p style={{ marginTop: 12, color: 'var(--text-subtle)', fontSize: 14 }}>
+                Collecting charge sessions — need a couple more
+                charge/discharge cycles before BugJuice can score your habits.
+              </p>
+              <p style={{ marginTop: 8, color: 'var(--text-subtle)', fontSize: 13 }}>
+                In the meantime: keep the battery between{' '}
+                <strong>20%</strong> and <strong>80%</strong> most of the
+                time, and avoid leaving it at 100% for long periods.
+              </p>
+            </>
+          ) : (
+            <>
+              {/* Score + verdict */}
+              <div style={{ display: 'flex', alignItems: 'baseline', gap: 12, marginTop: 12 }}>
+                <span
+                  style={{
+                    fontSize: 40,
+                    fontWeight: 700,
+                    color: habits.score >= 70 ? 'var(--accent)' : habits.score >= 50 ? 'var(--text)' : 'var(--danger, #ef4444)',
+                  }}
+                >
+                  {habits.score}
+                </span>
+                <span style={{ fontSize: 14, color: 'var(--text-muted)' }}>
+                  / 100 — {habits.verdict}
+                </span>
+              </div>
+
+              {/* Provisional warning */}
+              {habits.isProvisional && (
+                <p
+                  style={{
+                    marginTop: 8,
+                    padding: '8px 12px',
+                    background: 'var(--bg-inset)',
+                    borderRadius: 'var(--radius-sm)',
+                    fontSize: 12,
+                    color: 'var(--text-muted)',
+                  }}
+                >
+                  Based on {habits.dataDays < 1 ? 'less than a day' : `~${Math.round(habits.dataDays)} day${Math.round(habits.dataDays) === 1 ? '' : 's'}`} of
+                  data — this score may not reflect your actual habits until
+                  after the first week.
+                </p>
+              )}
+
+              {/* Metrics grid */}
+              <div
+                style={{
+                  display: 'grid',
+                  gridTemplateColumns: '1fr 1fr',
+                  gap: '12px 24px',
+                  marginTop: 16,
+                  fontSize: 13,
+                }}
+              >
+                <MetricRow
+                  label="Avg max charge"
+                  value={`${habits.metrics.avgMaxCharge.toFixed(0)}%`}
+                />
+                <MetricRow
+                  label="Charged above 80%"
+                  value={`${habits.metrics.overchargePct.toFixed(0)}% of sessions`}
+                />
+                <MetricRow
+                  label="Drained below 20%"
+                  value={`${habits.metrics.deepDischargePct.toFixed(0)}% of sessions`}
+                />
+                <MetricRow
+                  label="Time at 100%"
+                  value={
+                    habits.metrics.timeAt100Minutes < 60
+                      ? `${Math.round(habits.metrics.timeAt100Minutes)} min`
+                      : `${(habits.metrics.timeAt100Minutes / 60).toFixed(1)} hrs`
+                  }
+                />
+              </div>
+
+              {/* Tips */}
+              {habits.tips.length > 0 && (
+                <ul
+                  style={{
+                    marginTop: 14,
+                    paddingLeft: 18,
+                    fontSize: 13,
+                    color: 'var(--text-subtle)',
+                    lineHeight: 1.6,
+                  }}
+                >
+                  {habits.tips.map((tip, i) => (
+                    <li key={i}>{tip}</li>
+                  ))}
+                </ul>
+              )}
+            </>
+          )}
+
+          {/* Always show the 80% reminder tip */}
           <div
             style={{
               marginTop: 16,
@@ -265,6 +359,15 @@ function HeroStat({
       <div className="stat-context" style={{ marginTop: 4 }}>
         {context}
       </div>
+    </div>
+  );
+}
+
+function MetricRow({ label, value }: { label: string; value: string }) {
+  return (
+    <div style={{ display: 'flex', justifyContent: 'space-between' }}>
+      <span style={{ color: 'var(--text-muted)' }}>{label}</span>
+      <span style={{ fontWeight: 500 }}>{value}</span>
     </div>
   );
 }

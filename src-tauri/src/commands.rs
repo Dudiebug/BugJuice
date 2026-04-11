@@ -56,7 +56,9 @@ fn build_battery_status(snap: &BatterySnapshot) -> BatteryStatusDto {
     let rate_w = if status.rate != BATTERY_UNKNOWN_RATE {
         status.rate as f64 / 1000.0
     } else {
-        0.0
+        // Fallback: use the computed rate from the polling thread (capacity
+        // delta over time). Returns 0.0 if no computed rate is available yet.
+        crate::polling::last_battery_rate_w()
     };
 
     let on_ac = status.power_state & BATTERY_POWER_ON_LINE != 0;
@@ -112,12 +114,16 @@ fn compute_eta(
     on_ac: bool,
     percent: f64,
 ) -> (Option<i64>, String) {
-    if rate_w.abs() < 0.5 || status.rate == BATTERY_UNKNOWN_RATE {
+    if rate_w.abs() < 0.5 {
         if on_ac && percent > 99.0 {
             return (None, "Fully charged".into());
         }
         return (None, "Rate not reported".into());
     }
+
+    // Use rate_w (watts) for all ETA math. This works whether the rate came
+    // from the IOCTL directly or from the computed capacity-delta fallback.
+    let rate_mw = rate_w * 1000.0; // convert W → mW for mWh capacity math
 
     if rate_w > 0.0 {
         // charging
@@ -125,7 +131,7 @@ fn compute_eta(
         if to_full == 0 {
             return (None, "Fully charged".into());
         }
-        let hours = to_full as f64 / status.rate as f64;
+        let hours = to_full as f64 / rate_mw;
         let minutes = (hours * 60.0).round() as i64;
         let h = minutes / 60;
         let m = minutes % 60;
@@ -134,10 +140,11 @@ fn compute_eta(
         } else {
             format!("{m} min")
         };
-        (Some(minutes), format!("about {dur} to full at this rate"))
+        let suffix = if status.rate == BATTERY_UNKNOWN_RATE { " (estimated)" } else { "" };
+        (Some(minutes), format!("about {dur} to full at this rate{suffix}"))
     } else {
         // discharging
-        let hours = status.capacity as f64 / -status.rate as f64;
+        let hours = status.capacity as f64 / -rate_mw;
         let minutes = (hours * 60.0).round() as i64;
         let h = minutes / 60;
         let m = minutes % 60;
@@ -146,7 +153,8 @@ fn compute_eta(
         } else {
             format!("{m} min")
         };
-        (Some(minutes), format!("about {dur} left at this rate"))
+        let suffix = if status.rate == BATTERY_UNKNOWN_RATE { " (estimated)" } else { "" };
+        (Some(minutes), format!("about {dur} left at this rate{suffix}"))
     }
 }
 
@@ -184,11 +192,9 @@ pub struct PowerReadingDto {
 
 #[tauri::command]
 pub fn get_power_reading() -> Result<PowerReadingDto, String> {
-    // Read the EMI counters directly — same code path the CLI uses and
-    // proves works on Snapdragon X without elevation. Use a 1-second
-    // window; the Qualcomm EMI driver sometimes returns identical counter
-    // values for sub-second deltas.
-    match power::read_all_emi(std::time::Duration::from_secs(1)) {
+    // Read EMI data from the bugjuice-service via named pipe. The service
+    // runs as SYSTEM and handles the privileged EMI reads.
+    match crate::pipe_client::read_emi() {
         Ok(readings) if !readings.is_empty() => Ok(power_dto_from_emi(&readings[0])),
         Ok(_) => Ok(PowerReadingDto {
             wall_input_w: None,
@@ -311,6 +317,7 @@ pub struct TopAppsResponse {
     pub apps: Vec<AppPowerDto>,
     pub confidence_percent: f64,
     pub battery_discharge_w: f64,
+    pub system_overhead_w: f64,
 }
 
 #[tauri::command]
@@ -327,18 +334,29 @@ pub fn get_top_apps() -> Result<TopAppsResponse, String> {
             name: r.process_name,
             cpu_w: r.cpu_watts,
             gpu_w: r.gpu_watts,
-            disk_w: 0.0,
-            net_w: 0.0,
+            disk_w: r.disk_watts,
+            net_w: r.net_watts,
             total_w: r.total_watts,
         })
         .collect();
 
     let total_attributed: f64 = apps.iter().map(|a| a.total_w).sum();
 
-    // Get latest battery discharge rate for confidence calculation
+    // Battery discharge rate (negative = discharging).
     let battery_w = crate::polling::last_battery_rate_w();
-    let confidence = if battery_w.abs() > 0.5 {
-        (total_attributed / battery_w.abs() * 100.0).clamp(0.0, 100.0)
+    let discharge = battery_w.abs();
+
+    // System overhead = total battery drain minus what we attributed to apps.
+    // This includes idle platform power (display, DRAM refresh, VRMs, etc.)
+    // plus any measurement gap.
+    let system_overhead = if discharge > 0.5 {
+        (discharge - total_attributed).max(0.0)
+    } else {
+        0.0
+    };
+
+    let confidence = if discharge > 0.5 {
+        ((total_attributed + system_overhead) / discharge * 100.0).clamp(0.0, 100.0)
     } else {
         0.0
     };
@@ -347,6 +365,7 @@ pub fn get_top_apps() -> Result<TopAppsResponse, String> {
         apps,
         confidence_percent: confidence,
         battery_discharge_w: battery_w,
+        system_overhead_w: system_overhead,
     })
 }
 
@@ -498,6 +517,238 @@ pub fn get_health_history() -> Result<Vec<HealthSnapshotDto>, String> {
         .collect())
 }
 
+// ─── Charge speed tracking ────────────────────────────────────────────────
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct ChargeSpeedDto {
+    pub current_rate_w: f64,
+    pub max_rate_w: f64,
+    pub avg_rate_w: f64,
+    pub time_to_full_min: Option<i64>,
+    pub eta_label: String,
+    pub start_percent: f64,
+    pub current_percent: f64,
+}
+
+#[tauri::command]
+pub fn get_charge_speed() -> Result<ChargeSpeedDto, String> {
+    let snap = battery::snapshot_all().and_then(|v| v.into_iter().next().ok_or_else(|| "no battery found".into())).map_err(|e| format!("battery: {e}"))?;
+    let storage = storage::global().ok_or("storage not initialized")?;
+    let session_id = storage.current_session_id();
+
+    let rate_w = if snap.status.rate != BATTERY_UNKNOWN_RATE {
+        snap.status.rate as f64 / 1000.0
+    } else {
+        crate::polling::last_battery_rate_w()
+    };
+
+    let (max_r, avg_r) = storage
+        .read_session_charge_stats(session_id)
+        .unwrap_or((0.0, 0.0));
+
+    let percent = if snap.status.capacity != BATTERY_UNKNOWN_CAPACITY
+        && snap.info.full_charged_capacity > 0
+    {
+        snap.status.capacity as f64 / snap.info.full_charged_capacity as f64 * 100.0
+    } else {
+        0.0
+    };
+
+    let on_ac = snap.status.power_state & BATTERY_POWER_ON_LINE != 0;
+    let (eta_min, eta_label) = compute_eta(rate_w, &snap.status, &snap.info, on_ac, percent);
+
+    // Start percent comes from the current session row.
+    let start_pct = storage
+        .read_battery_sessions()
+        .ok()
+        .and_then(|sessions| {
+            sessions
+                .into_iter()
+                .find(|s| s.id == session_id && s.on_ac)
+                .and_then(|s| s.start_percent)
+        })
+        .unwrap_or(percent);
+
+    Ok(ChargeSpeedDto {
+        current_rate_w: rate_w.max(0.0),
+        max_rate_w: max_r,
+        avg_rate_w: avg_r,
+        time_to_full_min: eta_min,
+        eta_label,
+        start_percent: start_pct,
+        current_percent: percent,
+    })
+}
+
+// ─── Charge habit scoring ─────────────────────────────────────────────────
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct ChargeHabitDto {
+    pub score: u32,
+    pub verdict: String,
+    pub has_enough_data: bool,
+    pub is_provisional: bool,
+    pub data_days: f64,
+    pub metrics: ChargeHabitMetricsDto,
+    pub tips: Vec<String>,
+}
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct ChargeHabitMetricsDto {
+    pub avg_max_charge: f64,
+    pub overcharge_pct: f64,
+    pub deep_discharge_pct: f64,
+    pub time_at_100_minutes: f64,
+    pub charges_to_100: i64,
+    pub discharges_below_20: i64,
+}
+
+#[tauri::command]
+pub fn get_charge_habits() -> Result<ChargeHabitDto, String> {
+    let storage = storage::global().ok_or("storage not initialized")?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    // Look back 30 days — the scoring algorithm uses whatever sessions are
+    // available, even if only 24 hours old.
+    let since = now - 30 * 86400;
+    let d = storage
+        .read_charge_habit_data(since)
+        .map_err(|e| format!("charge habits: {e}"))?;
+
+    let total_sessions = d.charge_sessions + d.discharge_sessions;
+    if total_sessions < 2 {
+        return Ok(ChargeHabitDto {
+            score: 0,
+            verdict: String::new(),
+            has_enough_data: false,
+            is_provisional: true,
+            data_days: 0.0,
+            metrics: ChargeHabitMetricsDto {
+                avg_max_charge: 0.0,
+                overcharge_pct: 0.0,
+                deep_discharge_pct: 0.0,
+                time_at_100_minutes: 0.0,
+                charges_to_100: 0,
+                discharges_below_20: 0,
+            },
+            tips: Vec::new(),
+        });
+    }
+
+    let data_days = match (d.oldest_ts, d.newest_ts) {
+        (Some(a), Some(b)) => (b - a).max(0) as f64 / 86400.0,
+        _ => 0.0,
+    };
+
+    // ── Scoring: start at 100, subtract penalties ──
+    let mut penalties: Vec<(f64, &str)> = Vec::new();
+
+    // Overcharge: charges ending > 80%
+    if d.charge_sessions > 0 {
+        let ratio = d.charges_above_80 as f64 / d.charge_sessions as f64;
+        penalties.push((ratio * 30.0, "Charging above 80% wears the battery faster. Try setting BugJuice's charge-limit reminder to 80%."));
+    }
+
+    // Full charge: charges ending ≥ 99%
+    if d.charge_sessions > 0 {
+        let ratio = d.charges_to_100 as f64 / d.charge_sessions as f64;
+        penalties.push((ratio * 15.0, "Topping off to 100% regularly adds stress. Unplugging at 80% can significantly extend lifespan."));
+    }
+
+    // Deep discharge: below 20%
+    if d.discharge_sessions > 0 {
+        let ratio = d.discharges_below_20 as f64 / d.discharge_sessions as f64;
+        penalties.push((ratio * 20.0, "Draining below 20% stresses lithium-ion cells. Try plugging in sooner."));
+    }
+
+    // Critical discharge: below 10%
+    if d.discharge_sessions > 0 {
+        let ratio = d.discharges_below_10 as f64 / d.discharge_sessions as f64;
+        penalties.push((ratio * 20.0, "Deep discharges below 10% cause accelerated wear. Avoid letting the battery get critical."));
+    }
+
+    // Time at 100%
+    let hours_at_100 = d.time_at_100_secs as f64 / 3600.0;
+    penalties.push((
+        (hours_at_100 * 2.0).min(15.0),
+        "Extended time at 100% while plugged in degrades capacity. Unplug once fully charged.",
+    ));
+
+    let total_penalty: f64 = penalties.iter().map(|(p, _)| *p).sum();
+    let score = (100.0 - total_penalty).clamp(0.0, 100.0) as u32;
+
+    let verdict = match score {
+        85..=100 => "excellent",
+        70..=84 => "good",
+        50..=69 => "fair",
+        _ => "poor",
+    }
+    .to_string();
+
+    // Top 2 tips from the biggest penalties
+    let mut sorted = penalties.clone();
+    sorted.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+    let tips: Vec<String> = sorted
+        .iter()
+        .filter(|(p, _)| *p > 1.0)
+        .take(2)
+        .map(|(_, msg)| msg.to_string())
+        .collect();
+
+    let overcharge_pct = if d.charge_sessions > 0 {
+        d.charges_above_80 as f64 / d.charge_sessions as f64 * 100.0
+    } else {
+        0.0
+    };
+    let deep_discharge_pct = if d.discharge_sessions > 0 {
+        d.discharges_below_20 as f64 / d.discharge_sessions as f64 * 100.0
+    } else {
+        0.0
+    };
+
+    Ok(ChargeHabitDto {
+        score,
+        verdict,
+        has_enough_data: true,
+        is_provisional: data_days < 7.0,
+        data_days,
+        metrics: ChargeHabitMetricsDto {
+            avg_max_charge: d.avg_max_soc,
+            overcharge_pct,
+            deep_discharge_pct,
+            time_at_100_minutes: d.time_at_100_secs as f64 / 60.0,
+            charges_to_100: d.charges_to_100,
+            discharges_below_20: d.discharges_below_20,
+        },
+        tips,
+    })
+}
+
+// ─── Data retention / pruning ────────────────────────────────────────────
+
+use std::sync::atomic::{AtomicU32, Ordering as RetentionOrdering};
+
+static DATA_RETENTION_DAYS: AtomicU32 = AtomicU32::new(30);
+
+pub fn data_retention_days() -> u32 {
+    DATA_RETENTION_DAYS.load(RetentionOrdering::Relaxed)
+}
+
+#[tauri::command]
+pub fn set_data_retention(days: u32) -> Result<(), String> {
+    let days = days.clamp(7, 365);
+    DATA_RETENTION_DAYS.store(days, RetentionOrdering::Relaxed);
+    if let Some(s) = storage::global() {
+        let _ = s.prune_old_data(days);
+    }
+    Ok(())
+}
+
 // ─── Component power history (for the Components page stacked chart) ──────
 
 #[derive(Serialize, Clone)]
@@ -507,23 +758,39 @@ pub struct ComponentHistoryPointDto {
     pub cpu: f64,
     pub gpu: f64,
     pub dram: f64,
+    pub modem: f64,
+    pub npu: f64,
     pub other: f64,
 }
 
 fn categorize_channel(name: &str) -> &'static str {
     let n = name.to_ascii_uppercase();
+    // GPU: Intel iGPU (PP1) or explicit GPU channel
     if n.contains("PP1") || n.contains("GPU") {
         "gpu"
+    // Modem / WWAN (Snapdragon X cellular)
+    } else if n.contains("MODEM") || n.contains("WWAN") || n.contains("CELLULAR") {
+        "modem"
+    // NPU / DSP (Snapdragon X neural engine)
+    } else if n.contains("NPU") || n.contains("DSP") || n.contains("NEURAL") {
+        "npu"
+    // Camera / ISP
+    } else if n.contains("ISP") || n.contains("CAMERA") {
+        "npu" // group with NPU for chart simplicity
     } else if n.contains("DRAM") {
         "dram"
-    } else if n.contains("PKG") || n.contains("PP0") || n.contains("CPU") {
+    // CPU: cores, cache, per-core channels
+    } else if n.contains("PKG") || n.contains("PP0") || n.contains("CPU")
+        || n.contains("CORE") || n.contains("L3") || n.contains("LLC") || n.contains("CACHE")
+    {
         "cpu"
-    } else if n == "SYS" || n.contains("SOC") || n.contains("PLATFORM") || n.contains("PSYS") {
-        // Treat whole-system channels as "other" for the stacked chart.
-        // The chart is a component breakdown, not a total.
+    // Whole-system / SoC / interconnect
+    } else if n == "SYS" || n.contains("SOC") || n.contains("PLATFORM") || n.contains("PSYS")
+        || n.contains("FABRIC") || n.contains("NOC") || n.contains("INTERCONNECT")
+    {
         "other"
-    } else if n.contains("PSU") || n.contains("USBC") {
-        // Wall input — exclude from the component stack.
+    // Wall input — exclude from the component stack.
+    } else if n.contains("PSU") || n.contains("USBC") || n.contains("USB_C") {
         "skip"
     } else {
         "other"
@@ -538,33 +805,39 @@ pub fn get_component_history(minutes: i64) -> Result<Vec<ComponentHistoryPointDt
         .map_err(|e| format!("read power history: {e}"))?;
 
     // Bucket per-second, categorize per channel, then sum within each
-    // category. The chart wants { ts, cpu, gpu, dram, other } rows.
+    // category. The chart wants { ts, cpu, gpu, dram, modem, npu, other }.
     use std::collections::BTreeMap;
-    let mut buckets: BTreeMap<i64, (f64, f64, f64, f64)> = BTreeMap::new();
+    #[derive(Default, Clone, Copy)]
+    struct Bucket { cpu: f64, gpu: f64, dram: f64, modem: f64, npu: f64, other: f64 }
+    let mut buckets: BTreeMap<i64, Bucket> = BTreeMap::new();
     for (name, samples) in grouped {
         let cat = categorize_channel(&name);
         if cat == "skip" {
             continue;
         }
         for (ts, watts) in samples {
-            let slot = buckets.entry(ts).or_insert((0.0, 0.0, 0.0, 0.0));
+            let b = buckets.entry(ts).or_default();
             match cat {
-                "cpu" => slot.0 += watts,
-                "gpu" => slot.1 += watts,
-                "dram" => slot.2 += watts,
-                _ => slot.3 += watts,
+                "cpu" => b.cpu += watts,
+                "gpu" => b.gpu += watts,
+                "dram" => b.dram += watts,
+                "modem" => b.modem += watts,
+                "npu" => b.npu += watts,
+                _ => b.other += watts,
             }
         }
     }
 
     Ok(buckets
         .into_iter()
-        .map(|(ts, (cpu, gpu, dram, other))| ComponentHistoryPointDto {
+        .map(|(ts, b)| ComponentHistoryPointDto {
             ts,
-            cpu,
-            gpu,
-            dram,
-            other,
+            cpu: b.cpu,
+            gpu: b.gpu,
+            dram: b.dram,
+            modem: b.modem,
+            npu: b.npu,
+            other: b.other,
         })
         .collect())
 }
@@ -611,7 +884,10 @@ pub fn get_session_detail(session_id: i64) -> Result<SessionDetailDto, String> {
         sum_r += r.rate_w;
     }
     let avg = sum_r / rows.len() as f64;
-    let duration = rows.last().unwrap().ts - rows.first().unwrap().ts;
+    let duration = match (rows.first(), rows.last()) {
+        (Some(first), Some(last)) => last.ts - first.ts,
+        _ => 0,
+    };
     let total_energy = avg.abs() * (duration as f64 / 3600.0) * 1000.0;
 
     let history = rows
@@ -627,8 +903,8 @@ pub fn get_session_detail(session_id: i64) -> Result<SessionDetailDto, String> {
         history,
         min_rate_w: if min_r.is_finite() { min_r } else { 0.0 },
         max_rate_w: if max_r.is_finite() { max_r } else { 0.0 },
-        avg_rate_w: avg,
-        total_energy_mwh: total_energy,
+        avg_rate_w: if avg.is_finite() { avg } else { 0.0 },
+        total_energy_mwh: if total_energy.is_finite() { total_energy } else { 0.0 },
         duration_sec: duration,
     })
 }
@@ -642,6 +918,7 @@ pub struct AppPowerSummaryDto {
     pub avg_watts: f64,
     pub max_watts: f64,
     pub sample_count: i64,
+    pub total_energy: f64,
 }
 
 // ─── Unified timeline (Sessions page) ─────────────────────────────────────────
@@ -712,30 +989,36 @@ pub fn get_unified_timeline(start_ts: i64, end_ts: i64) -> Result<UnifiedTimelin
             .read_power_history_range(start_ts, end_ts)
             .map_err(|e| format!("read power history range: {e}"))?;
         use std::collections::BTreeMap;
-        let mut buckets: BTreeMap<i64, (f64, f64, f64, f64)> = BTreeMap::new();
+        #[derive(Default, Clone, Copy)]
+        struct B { cpu: f64, gpu: f64, dram: f64, modem: f64, npu: f64, other: f64 }
+        let mut buckets: BTreeMap<i64, B> = BTreeMap::new();
         for (name, samples) in grouped {
             let cat = categorize_channel(&name);
             if cat == "skip" {
                 continue;
             }
             for (ts, watts) in samples {
-                let slot = buckets.entry(ts).or_insert((0.0, 0.0, 0.0, 0.0));
+                let b = buckets.entry(ts).or_default();
                 match cat {
-                    "cpu" => slot.0 += watts,
-                    "gpu" => slot.1 += watts,
-                    "dram" => slot.2 += watts,
-                    _ => slot.3 += watts,
+                    "cpu" => b.cpu += watts,
+                    "gpu" => b.gpu += watts,
+                    "dram" => b.dram += watts,
+                    "modem" => b.modem += watts,
+                    "npu" => b.npu += watts,
+                    _ => b.other += watts,
                 }
             }
         }
         buckets
             .into_iter()
-            .map(|(ts, (cpu, gpu, dram, other))| ComponentHistoryPointDto {
+            .map(|(ts, b)| ComponentHistoryPointDto {
                 ts,
-                cpu,
-                gpu,
-                dram,
-                other,
+                cpu: b.cpu,
+                gpu: b.gpu,
+                dram: b.dram,
+                modem: b.modem,
+                npu: b.npu,
+                other: b.other,
             })
             .collect()
     };
@@ -750,6 +1033,7 @@ pub fn get_unified_timeline(start_ts: i64, end_ts: i64) -> Result<UnifiedTimelin
             avg_watts: r.avg_watts,
             max_watts: r.max_watts,
             sample_count: r.sample_count,
+            total_energy: r.total_energy,
         })
         .collect();
 
@@ -887,6 +1171,54 @@ pub fn set_notification_prefs(prefs: NotificationPrefs) -> Result<(), String> {
     Ok(())
 }
 
+/// Debug command: fires a test notification and returns what the polling
+/// thread would currently check (prefs + battery state).
+#[tauri::command]
+pub fn test_notification() -> Result<String, String> {
+    let prefs = notification_prefs().lock().unwrap().clone();
+    let snap = crate::battery::snapshot_all()
+        .map_err(|e| format!("battery snapshot: {e}"))?
+        .into_iter()
+        .next()
+        .ok_or_else(|| "no battery".to_string())?;
+
+    let pct = if snap.status.capacity != crate::battery::BATTERY_UNKNOWN_CAPACITY
+        && snap.info.full_charged_capacity > 0
+    {
+        snap.status.capacity as f64 / snap.info.full_charged_capacity as f64 * 100.0
+    } else {
+        0.0
+    };
+    let on_ac = snap.status.power_state & crate::battery::BATTERY_POWER_ON_LINE != 0;
+
+    // Fire the test notification
+    crate::polling::fire_notification(
+        "BugJuice Test",
+        &format!(
+            "This is a test notification.\n\
+             Battery: {pct:.1}% | On AC: {on_ac}\n\
+             Charge limit: {:.0}% (notify: {})\n\
+             Low threshold: {:.0}% (notify: {})",
+            prefs.charge_limit, prefs.notify_charge,
+            prefs.low_threshold, prefs.notify_low,
+        ),
+    );
+
+    // Return debug info
+    Ok(format!(
+        "Fired test notification.\n\
+         Battery: {pct:.1}% | on_ac: {on_ac}\n\
+         charge_limit: {:.0}% (enabled: {}) → would fire: {}\n\
+         low_threshold: {:.0}% (enabled: {}) → would fire: {}",
+        prefs.charge_limit,
+        prefs.notify_charge,
+        prefs.notify_charge && on_ac && pct >= prefs.charge_limit,
+        prefs.low_threshold,
+        prefs.notify_low,
+        prefs.notify_low && !on_ac && pct <= prefs.low_threshold,
+    ))
+}
+
 // ─── Autostart ─────────────────────────────────────────────────────────────
 
 #[tauri::command]
@@ -905,4 +1237,434 @@ pub async fn disable_autostart(app: tauri::AppHandle) -> Result<(), String> {
 pub async fn is_autostart_enabled(app: tauri::AppHandle) -> Result<bool, String> {
     use tauri_plugin_autostart::ManagerExt;
     app.autolaunch().is_enabled().map_err(|e| e.to_string())
+}
+
+// ─── Start minimized ──────────────────────────────────────────────────────
+
+#[tauri::command]
+pub async fn set_start_minimized(app: tauri::AppHandle, enabled: bool) -> Result<(), String> {
+    use tauri::Manager;
+    let data_dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
+    let flag = data_dir.join(".start-minimized");
+    if enabled {
+        std::fs::write(&flag, "1").map_err(|e| e.to_string())
+    } else {
+        if flag.exists() {
+            std::fs::remove_file(&flag).map_err(|e| e.to_string())
+        } else {
+            Ok(())
+        }
+    }
+}
+
+#[tauri::command]
+pub async fn get_start_minimized(app: tauri::AppHandle) -> Result<bool, String> {
+    use tauri::Manager;
+    let data_dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
+    Ok(data_dir.join(".start-minimized").exists())
+}
+
+// ─── Export to JSON ──────────────────────────────────────────────────────
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct BugJuiceReport {
+    exported_at: String,
+    version: String,
+    battery_status: BatteryStatusDto,
+    health_history: Vec<HealthSnapshotDto>,
+    charge_habits: ChargeHabitDto,
+    battery_sessions: Vec<BatterySessionDto>,
+    sleep_sessions: Vec<SleepSessionDto>,
+}
+
+#[tauri::command]
+pub async fn export_report_json(app: tauri::AppHandle) -> Result<String, String> {
+    use tauri_plugin_dialog::DialogExt;
+
+    let snap = battery::snapshot_all().and_then(|v| v.into_iter().next().ok_or_else(|| "no battery found".into())).map_err(|e| format!("battery: {e}"))?;
+    let status_dto = build_battery_status(&snap);
+
+    let storage = storage::global().ok_or("storage not initialized")?;
+
+    let health = storage
+        .read_health_history()
+        .map_err(|e| format!("health: {e}"))?
+        .into_iter()
+        .map(|r| HealthSnapshotDto {
+            ts: r.ts,
+            design_capacity: r.design_capacity,
+            full_charge_capacity: r.full_charge_capacity,
+            cycle_count: r.cycle_count.unwrap_or(0),
+            wear_percent: r.wear_percent.unwrap_or(0.0),
+        })
+        .collect();
+
+    let habits = get_charge_habits().unwrap_or_else(|_| ChargeHabitDto {
+        score: 0,
+        verdict: String::new(),
+        has_enough_data: false,
+        is_provisional: true,
+        data_days: 0.0,
+        metrics: ChargeHabitMetricsDto {
+            avg_max_charge: 0.0,
+            overcharge_pct: 0.0,
+            deep_discharge_pct: 0.0,
+            time_at_100_minutes: 0.0,
+            charges_to_100: 0,
+            discharges_below_20: 0,
+        },
+        tips: Vec::new(),
+    });
+
+    let sessions = get_battery_sessions().unwrap_or_default();
+    let sleeps = get_sleep_sessions().unwrap_or_default();
+
+    let report = BugJuiceReport {
+        exported_at: chrono_now(),
+        version: "0.4.0-beta".to_string(),
+        battery_status: status_dto,
+        health_history: health,
+        charge_habits: habits,
+        battery_sessions: sessions,
+        sleep_sessions: sleeps,
+    };
+
+    let json = serde_json::to_string_pretty(&report)
+        .map_err(|e| format!("serialize: {e}"))?;
+
+    // Show save-file dialog.
+    let path = app
+        .dialog()
+        .file()
+        .set_file_name("bugjuice-report.json")
+        .add_filter("JSON", &["json"])
+        .blocking_save_file();
+
+    let Some(path) = path else {
+        return Ok("cancelled".to_string());
+    };
+
+    std::fs::write(path.as_path().unwrap(), &json)
+        .map_err(|e| format!("write: {e}"))?;
+
+    Ok("exported".to_string())
+}
+
+// ─── Power plan auto-switching ───────────────────────────────────────────
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct PowerPlanStatusDto {
+    pub enabled: bool,
+    pub low_threshold: u32,
+    pub high_threshold: u32,
+    pub active_scheme: String,
+}
+
+#[tauri::command]
+pub fn get_power_plan_status() -> Result<PowerPlanStatusDto, String> {
+    let (low, high) = crate::power_plan::thresholds();
+    let active = crate::power_plan::get_active_scheme()
+        .map(|g| crate::power_plan::scheme_name(&g).to_string())
+        .unwrap_or_else(|| "unknown".into());
+    Ok(PowerPlanStatusDto {
+        enabled: crate::power_plan::is_enabled(),
+        low_threshold: low,
+        high_threshold: high,
+        active_scheme: active,
+    })
+}
+
+#[tauri::command]
+pub fn set_power_plan_config(enabled: bool, low: u32, high: u32) -> Result<(), String> {
+    crate::power_plan::set_enabled(enabled);
+    crate::power_plan::set_thresholds(low, high);
+    Ok(())
+}
+
+fn chrono_now() -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    // ISO-ish format from unix timestamp (no chrono dependency).
+    let secs_per_day = 86400u64;
+    let days = now / secs_per_day;
+    let rem = now % secs_per_day;
+    let h = rem / 3600;
+    let m = (rem % 3600) / 60;
+    let s = rem % 60;
+    // Rough year/month/day from days-since-epoch.
+    let (y, mo, d) = days_to_ymd(days);
+    format!("{y:04}-{mo:02}-{d:02}T{h:02}:{m:02}:{s:02}Z")
+}
+
+fn days_to_ymd(mut days: u64) -> (u64, u64, u64) {
+    // Simple Gregorian conversion. Good enough for a timestamp.
+    let mut y = 1970;
+    loop {
+        let ylen = if y % 4 == 0 && (y % 100 != 0 || y % 400 == 0) {
+            366
+        } else {
+            365
+        };
+        if days < ylen {
+            break;
+        }
+        days -= ylen;
+        y += 1;
+    }
+    let leap = y % 4 == 0 && (y % 100 != 0 || y % 400 == 0);
+    let mdays = [
+        31,
+        if leap { 29 } else { 28 },
+        31, 30, 31, 30, 31, 31, 30, 31, 30, 31,
+    ];
+    let mut mo = 0;
+    for &ml in &mdays {
+        if days < ml {
+            break;
+        }
+        days -= ml;
+        mo += 1;
+    }
+    (y, mo + 1, days + 1)
+}
+
+// ─── Export to PDF ──────────────────────────────────────────────────────
+
+#[tauri::command]
+pub async fn export_report_pdf(app: tauri::AppHandle) -> Result<String, String> {
+    use printpdf::*;
+    use tauri_plugin_dialog::DialogExt;
+
+    let snap = battery::snapshot_all()
+        .and_then(|v| v.into_iter().next().ok_or_else(|| "no battery found".into()))
+        .map_err(|e| format!("battery: {e}"))?;
+    let status = build_battery_status(&snap);
+
+    let habits = get_charge_habits().unwrap_or_else(|_| ChargeHabitDto {
+        score: 0,
+        verdict: String::new(),
+        has_enough_data: false,
+        is_provisional: true,
+        data_days: 0.0,
+        metrics: ChargeHabitMetricsDto {
+            avg_max_charge: 0.0,
+            overcharge_pct: 0.0,
+            deep_discharge_pct: 0.0,
+            time_at_100_minutes: 0.0,
+            charges_to_100: 0,
+            discharges_below_20: 0,
+        },
+        tips: Vec::new(),
+    });
+
+    let sessions = get_battery_sessions().unwrap_or_default();
+    let sleeps = get_sleep_sessions().unwrap_or_default();
+
+    // ── Build PDF ───────────────────────────────────────────────────
+    let (doc, page1, layer1) = PdfDocument::new(
+        "BugJuice Battery Report",
+        Mm(210.0),
+        Mm(297.0),
+        "Content",
+    );
+    let font = doc.add_builtin_font(BuiltinFont::Helvetica).map_err(|e| format!("font: {e}"))?;
+    let bold = doc.add_builtin_font(BuiltinFont::HelveticaBold).map_err(|e| format!("font: {e}"))?;
+    let layer = doc.get_page(page1).get_layer(layer1);
+
+    let black = Color::Rgb(Rgb::new(0.1, 0.1, 0.1, None));
+    let gray = Color::Rgb(Rgb::new(0.4, 0.4, 0.4, None));
+    let green = Color::Rgb(Rgb::new(0.13, 0.77, 0.37, None));
+    let mut y = 270.0f32;
+
+    // Title
+    layer.set_fill_color(green);
+    layer.use_text("BugJuice Battery Report", 22.0, Mm(20.0), Mm(y), &bold);
+    y -= 8.0;
+    layer.set_fill_color(gray.clone());
+    layer.use_text(&format!("Generated {}", chrono_now()), 10.0, Mm(20.0), Mm(y), &font);
+    y -= 14.0;
+
+    // Battery Status
+    layer.set_fill_color(black.clone());
+    layer.use_text("Battery Status", 16.0, Mm(20.0), Mm(y), &bold);
+    y -= 7.0;
+    layer.set_fill_color(gray.clone());
+    for line in &[
+        format!("Charge: {:.1}%  |  Wear: {:.1}%  |  Cycles: {}", status.percent, status.wear_percent, status.cycle_count),
+        format!("Rate: {:.2} W  |  Voltage: {:.2} V", status.rate_w, status.voltage_v),
+        format!("Chemistry: {}  |  Manufacturer: {}  |  Model: {}", status.chemistry, status.manufacturer, status.device_name),
+        format!("Designed: {} mWh  |  Full charge: {} mWh", status.design_mwh, status.full_charge_mwh),
+    ] {
+        layer.use_text(line, 10.0, Mm(20.0), Mm(y), &font);
+        y -= 5.0;
+    }
+    y -= 6.0;
+
+    // Charge Habits
+    layer.set_fill_color(black.clone());
+    layer.use_text("Charge Habits", 16.0, Mm(20.0), Mm(y), &bold);
+    y -= 7.0;
+    layer.set_fill_color(gray.clone());
+    if habits.has_enough_data {
+        layer.use_text(&format!("Score: {} / 100 -- {}", habits.score, habits.verdict), 11.0, Mm(20.0), Mm(y), &font);
+        y -= 5.0;
+        layer.use_text(&format!("Avg max charge: {:.0}%  |  Overcharge: {:.0}%  |  Deep discharge: {:.0}%",
+            habits.metrics.avg_max_charge, habits.metrics.overcharge_pct, habits.metrics.deep_discharge_pct),
+            10.0, Mm(20.0), Mm(y), &font);
+        y -= 5.0;
+        for tip in &habits.tips {
+            layer.use_text(&format!("  - {tip}"), 9.0, Mm(20.0), Mm(y), &font);
+            y -= 4.5;
+        }
+    } else {
+        layer.use_text("Not enough data yet", 10.0, Mm(20.0), Mm(y), &font);
+        y -= 5.0;
+    }
+    y -= 6.0;
+
+    // Recent Sessions
+    layer.set_fill_color(black.clone());
+    layer.use_text("Recent Battery Sessions", 16.0, Mm(20.0), Mm(y), &bold);
+    y -= 7.0;
+    layer.set_fill_color(gray.clone());
+    for s in sessions.iter().take(10) {
+        let kind = if s.on_ac { "AC" } else { "Battery" };
+        let drain = s.avg_drain_w.map(|w| format!("{w:.1}W avg")).unwrap_or_default();
+        let pct = format!("{:.0}% -> {}", s.start_percent,
+            s.end_percent.map(|p| format!("{p:.0}%")).unwrap_or_else(|| "ongoing".into()));
+        layer.use_text(&format!("{kind}  {pct}  {drain}"), 9.0, Mm(20.0), Mm(y), &font);
+        y -= 4.5;
+        if y < 20.0 { break; }
+    }
+    y -= 6.0;
+
+    // Sleep Sessions
+    if !sleeps.is_empty() && y > 40.0 {
+        layer.set_fill_color(black);
+        layer.use_text("Recent Sleep Sessions", 16.0, Mm(20.0), Mm(y), &bold);
+        y -= 7.0;
+        layer.set_fill_color(gray);
+        for s in sleeps.iter().take(10) {
+            let drain = s.drain_mwh.map(|m| format!("{m} mWh")).unwrap_or_default();
+            let rate = s.drain_rate_mw.map(|r| format!("{r:.0} mW")).unwrap_or_default();
+            let verdict = s.verdict.as_deref().unwrap_or("unknown");
+            layer.use_text(&format!("Drain: {drain}  Rate: {rate}  ({verdict})"),
+                9.0, Mm(20.0), Mm(y), &font);
+            y -= 4.5;
+            if y < 20.0 { break; }
+        }
+    }
+
+    // Footer
+    let footer_gray = Color::Rgb(Rgb::new(0.5, 0.5, 0.5, None));
+    layer.set_fill_color(footer_gray);
+    layer.use_text("Generated by BugJuice -- dudiebug.net/bugjuice", 8.0, Mm(20.0), Mm(10.0), &font);
+
+    // ── Save via dialog ─────────────────────────────────────────────
+    let bytes = doc.save_to_bytes().map_err(|e| format!("pdf save: {e}"))?;
+
+    let path = app
+        .dialog()
+        .file()
+        .set_file_name("bugjuice-report.pdf")
+        .add_filter("PDF", &["pdf"])
+        .blocking_save_file();
+
+    let Some(path) = path else {
+        return Ok("cancelled".to_string());
+    };
+
+    std::fs::write(path.as_path().unwrap(), &bytes)
+        .map_err(|e| format!("write: {e}"))?;
+
+    Ok("exported".to_string())
+}
+
+// ─── "Before I unplug" estimate ─────────────────────────────────────────
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct UnplugDrainEntry {
+    pub name: String,
+    pub watts: f64,
+    pub est_hours: f64,
+}
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct UnplugEstimateDto {
+    pub total_hours: f64,
+    pub total_label: String,
+    pub top_drains: Vec<UnplugDrainEntry>,
+    pub system_overhead_w: f64,
+}
+
+#[tauri::command]
+pub fn get_unplug_estimate() -> Result<UnplugEstimateDto, String> {
+    let snap = battery::snapshot_all().and_then(|v| v.into_iter().next().ok_or_else(|| "no battery found".into())).map_err(|e| format!("battery: {e}"))?;
+    let storage = storage::global().ok_or("storage not initialized")?;
+
+    let remaining_mwh = if snap.status.capacity != BATTERY_UNKNOWN_CAPACITY {
+        snap.status.capacity as f64
+    } else {
+        return Err("capacity unknown".into());
+    };
+
+    let rows = storage
+        .read_recent_app_power()
+        .map_err(|e| format!("app_power: {e}"))?;
+
+    let total_app_w: f64 = rows.iter().map(|r| r.total_watts).sum();
+    // Use the latest battery rate as ground truth if available, else sum of apps + estimate.
+    let battery_w = crate::polling::last_battery_rate_w().abs();
+    let total_draw = if battery_w > 0.5 { battery_w } else { total_app_w + 3.0 };
+    let system_overhead = (total_draw - total_app_w).max(0.0);
+
+    let total_hours = if total_draw > 0.1 {
+        remaining_mwh / (total_draw * 1000.0)
+    } else {
+        0.0
+    };
+
+    let total_label = if total_hours > 0.0 {
+        let h = total_hours as u32;
+        let m = ((total_hours - h as f64) * 60.0).round() as u32;
+        if h > 0 {
+            format!("about {h}h {m}m of battery at current usage")
+        } else {
+            format!("about {m} min of battery at current usage")
+        }
+    } else {
+        "estimating…".to_string()
+    };
+
+    let mut top_drains: Vec<UnplugDrainEntry> = rows
+        .iter()
+        .filter(|r| r.total_watts > 0.01)
+        .take(5)
+        .map(|r| {
+            let est_h = if r.total_watts > 0.01 {
+                remaining_mwh / (r.total_watts * 1000.0)
+            } else {
+                0.0
+            };
+            UnplugDrainEntry {
+                name: r.process_name.clone(),
+                watts: r.total_watts,
+                est_hours: est_h,
+            }
+        })
+        .collect();
+    top_drains.truncate(5);
+
+    Ok(UnplugEstimateDto {
+        total_hours,
+        total_label,
+        top_drains,
+        system_overhead_w: system_overhead,
+    })
 }

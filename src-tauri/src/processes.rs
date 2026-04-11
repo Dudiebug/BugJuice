@@ -35,7 +35,22 @@ unsafe extern "system" {
         SystemInformationLength: u32,
         ReturnLength: *mut u32,
     ) -> i32;
+    fn NtQueryInformationProcess(
+        ProcessHandle: *mut c_void,
+        ProcessInformationClass: i32,
+        ProcessInformation: *mut c_void,
+        ProcessInformationLength: u32,
+        ReturnLength: *mut u32,
+    ) -> i32;
 }
+
+#[link(name = "kernel32")]
+unsafe extern "system" {
+    fn OpenProcess(dwDesiredAccess: u32, bInheritHandle: i32, dwProcessId: u32) -> *mut c_void;
+    fn CloseHandle(hObject: *mut c_void) -> i32;
+}
+
+const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
 
 const SYSTEM_PROCESS_INFORMATION_CLASS: i32 = 5;
 const SYSTEM_PROCESSOR_PERFORMANCE_INFORMATION_CLASS: i32 = 8;
@@ -279,4 +294,174 @@ pub fn idle_fraction(prev: &ProcessorTotals, curr: &ProcessorTotals) -> f64 {
     let total_delta =
         ((curr.kernel_100ns + curr.user_100ns) - (prev.kernel_100ns + prev.user_100ns)).max(1) as f64;
     (idle_delta / total_delta).clamp(0.0, 1.0)
+}
+
+// ─── ProcessEnergyValues ─────────────────────────────────────────────────────
+//
+// Windows E3 tracks per-process energy internally. We read it via the
+// undocumented NtQueryInformationProcess(ProcessEnergyValues) info class.
+// Struct layout from phnt headers (github.com/winsiderss/phnt).
+//
+// These counters are cumulative — snapshot twice and subtract for a delta.
+// No admin required (PROCESS_QUERY_LIMITED_INFORMATION access).
+
+const PROCESS_ENERGY_VALUES_INFO_CLASS: i32 = 77; // ProcessEnergyValues
+
+/// Raw struct returned by NtQueryInformationProcess(ProcessEnergyValues).
+/// Layout from phnt/ntapi: total size = 0x104 bytes (260).
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct RawProcessEnergyValues {
+    /// CPU cycles: [2 groups][4 entries] — accumulated cycles per processor set.
+    cycles: [[u64; 4]; 2],
+    disk_energy: u64,
+    network_tail_energy: u64,
+    mbb_tail_energy: u64,
+    network_tx_rx_bytes: u64,
+    mbb_tx_rx_bytes: u64,
+    foreground_duration: u32,
+    desktop_visible_duration: u32,
+    psm_foreground_duration: u32,
+    composition_rendered: u32,
+    composition_dirty_generated: u32,
+    composition_dirty_propagated: u32,
+    reserved1: u32,
+    /// Attributed CPU cycles: [4 groups][2 entries].
+    attributed_cycles: [[u64; 2]; 4],
+    /// Work-on-behalf cycles: [4 groups][2 entries].
+    work_on_behalf_cycles: [[u64; 2]; 4],
+}
+
+/// Simplified snapshot of per-process energy counters.
+#[derive(Clone, Debug)]
+pub struct ProcessEnergySnapshot {
+    pub pid: u32,
+    /// Sum of all CPU cycle groups (cumulative).
+    pub cpu_cycles: u64,
+    /// Disk energy counter (cumulative, arbitrary units).
+    pub disk_energy: u64,
+    /// Network tail energy counter (cumulative, arbitrary units).
+    pub network_energy: u64,
+}
+
+/// Per-process energy delta between two snapshots.
+#[derive(Clone, Debug)]
+pub struct ProcessEnergyDelta {
+    pub pid: u32,
+    pub name: String,
+    pub cpu_cycles_delta: u64,
+    pub disk_energy_delta: u64,
+    pub network_energy_delta: u64,
+}
+
+/// Whether ProcessEnergyValues is available on this Windows build.
+/// Cached after first attempt so we don't retry on every tick.
+static ENERGY_API_AVAILABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+pub fn energy_api_available() -> bool {
+    *ENERGY_API_AVAILABLE.get().unwrap_or(&true)
+}
+
+/// Query ProcessEnergyValues for a set of PIDs. Returns a map of
+/// PID → snapshot. PIDs that can't be opened are silently skipped.
+pub fn snapshot_energy_values(pids: &[u32]) -> HashMap<u32, ProcessEnergySnapshot> {
+    let mut out = HashMap::with_capacity(pids.len());
+
+    // Early exit if we already know the API isn't available.
+    if !energy_api_available() {
+        return out;
+    }
+
+    for &pid in pids {
+        if pid == 0 || pid == 4 {
+            continue; // skip Idle and System
+        }
+
+        unsafe {
+            let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+            if handle.is_null() {
+                continue;
+            }
+
+            let mut raw: RawProcessEnergyValues = std::mem::zeroed();
+            let mut ret_len: u32 = 0;
+            let status = NtQueryInformationProcess(
+                handle,
+                PROCESS_ENERGY_VALUES_INFO_CLASS,
+                &mut raw as *mut _ as *mut c_void,
+                size_of::<RawProcessEnergyValues>() as u32,
+                &mut ret_len,
+            );
+
+            CloseHandle(handle);
+
+            if status == STATUS_SUCCESS {
+                // Sum all cycle groups into one value.
+                let mut total_cycles: u64 = 0;
+                for group in &raw.cycles {
+                    for &val in group {
+                        total_cycles = total_cycles.wrapping_add(val);
+                    }
+                }
+
+                out.insert(
+                    pid,
+                    ProcessEnergySnapshot {
+                        pid,
+                        cpu_cycles: total_cycles,
+                        disk_energy: raw.disk_energy,
+                        network_energy: raw.network_tail_energy,
+                    },
+                );
+            } else if status == 0xC0000003u32 as i32 {
+                // STATUS_INVALID_INFO_CLASS — API not available on this build.
+                ENERGY_API_AVAILABLE.set(false).ok();
+                log::warn!(
+                    "ProcessEnergyValues (info class 77) not available; \
+                     falling back to CPU-time attribution"
+                );
+                break;
+            }
+            // Other errors (access denied, etc.) → skip this PID silently.
+        }
+    }
+    out
+}
+
+/// Compute per-process energy deltas between two snapshots.
+/// Processes that are in `curr` but not `prev` are skipped (first tick).
+/// Processes where any counter went backwards (restarted) are skipped.
+pub fn compute_energy_deltas(
+    prev: &HashMap<u32, ProcessEnergySnapshot>,
+    curr: &HashMap<u32, ProcessEnergySnapshot>,
+    names: &HashMap<u32, String>,
+) -> Vec<ProcessEnergyDelta> {
+    let mut out = Vec::new();
+    for (pid, c) in curr {
+        let Some(p) = prev.get(pid) else { continue };
+        // Wrapping subtraction handles counter overflow gracefully.
+        let cpu_delta = c.cpu_cycles.wrapping_sub(p.cpu_cycles);
+        let disk_delta = c.disk_energy.wrapping_sub(p.disk_energy);
+        let net_delta = c.network_energy.wrapping_sub(p.network_energy);
+        // Skip if all zeros (process did nothing) or absurdly large (restart).
+        if cpu_delta == 0 && disk_delta == 0 && net_delta == 0 {
+            continue;
+        }
+        if cpu_delta > u64::MAX / 2 {
+            continue; // counter wrapped or process restarted
+        }
+        let name = names
+            .get(pid)
+            .cloned()
+            .unwrap_or_else(|| format!("pid_{pid}"));
+        out.push(ProcessEnergyDelta {
+            pid: *pid,
+            name,
+            cpu_cycles_delta: cpu_delta,
+            disk_energy_delta: disk_delta,
+            network_energy_delta: net_delta,
+        });
+    }
+    out.sort_by(|a, b| b.cpu_cycles_delta.cmp(&a.cpu_cycles_delta));
+    out
 }
