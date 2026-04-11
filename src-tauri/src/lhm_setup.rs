@@ -149,7 +149,7 @@ pub async fn get_lhm_status() -> Result<LhmStatusDto, String> {
 #[tauri::command]
 pub async fn lhm_download() -> Result<LhmDownloadResult, String> {
     let dir = lhm_dir();
-    let zip_path = dir.join("LibreHardwareMonitor-net472.zip");
+    let zip_path = dir.join("LibreHardwareMonitor.zip");
 
     // Ensure the target directory exists.
     if let Err(e) = std::fs::create_dir_all(&dir) {
@@ -163,15 +163,17 @@ pub async fn lhm_download() -> Result<LhmDownloadResult, String> {
     let zip_str = zip_path.to_string_lossy().replace('\'', "''");
 
     // Single PowerShell script: query GitHub API for latest release, find the
-    // net472 zip asset, download it. Using Invoke-RestMethod + Invoke-WebRequest.
+    // main zip asset (not the .NET 10 variant), and download it.
     let script = format!(
         r#"
 $ErrorActionPreference = 'Stop'
 try {{
     $release = Invoke-RestMethod -Uri 'https://api.github.com/repos/LibreHardwareMonitor/LibreHardwareMonitor/releases/latest' -UseBasicParsing
-    $asset = $release.assets | Where-Object {{ $_.name -like 'LibreHardwareMonitor-net472*' }} | Select-Object -First 1
+    # Match "LibreHardwareMonitor.zip" or legacy "LibreHardwareMonitor-net472.zip",
+    # but NOT "LibreHardwareMonitor.NET.10.zip" or "LibreHardwareMonitorLib*".
+    $asset = $release.assets | Where-Object {{ $_.name -match '^LibreHardwareMonitor(|-net\d+)\.zip$' }} | Select-Object -First 1
     if (-not $asset) {{
-        Write-Error 'Could not find LibreHardwareMonitor-net472 asset in latest release'
+        Write-Error 'Could not find LibreHardwareMonitor zip in latest release'
         exit 1
     }}
     Invoke-WebRequest -Uri $asset.browser_download_url -OutFile '{zip_str}' -UseBasicParsing
@@ -243,7 +245,7 @@ pub async fn lhm_install(zip_path: Option<String>) -> Result<LhmInstallResult, S
     let zip = if let Some(ref p) = zip_path {
         PathBuf::from(p)
     } else {
-        dir.join("LibreHardwareMonitor-net472.zip")
+        dir.join("LibreHardwareMonitor.zip")
     };
 
     if !zip.exists() {

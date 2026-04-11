@@ -185,11 +185,12 @@ export function Dashboard() {
 
       {/* ─── Power breakdown ──────────────────────────────────────────── */}
       <section className="grid grid-4">
-        <PowerCard title="Wall input" watts={power.wallInputW} sub="from charger" />
+        <PowerCard title="Wall input" watts={power.wallInputW} sub="from charger" needsSetup={lhm?.needed} />
         <PowerCard
           title="System draw"
           watts={power.systemDrawW}
           sub="whole laptop"
+          needsSetup={lhm?.needed}
         />
         <PowerCard
           title="CPU package"
@@ -362,6 +363,15 @@ function PowerCard({
             {needsSetup ? (
               <a
                 href="#/settings"
+                onClick={(e) => {
+                  e.preventDefault();
+                  window.location.hash = '#/settings';
+                  requestAnimationFrame(() => {
+                    setTimeout(() => {
+                      document.getElementById('lhm-setup')?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+                    }, 100);
+                  });
+                }}
                 style={{ color: 'var(--accent)', textDecoration: 'none' }}
               >
                 needs setup

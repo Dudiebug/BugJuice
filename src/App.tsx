@@ -142,7 +142,15 @@ function LhmBanner({ onDismiss }: { onDismiss: () => void }) {
       <span>CPU and GPU power monitoring requires a quick one-time setup</span>
       <div style={{ display: 'flex', gap: 8, flexShrink: 0 }}>
         <button
-          onClick={() => navigate('/settings')}
+          onClick={() => {
+            navigate('/settings');
+            // Scroll to the LHM setup section after navigation renders.
+            requestAnimationFrame(() => {
+              setTimeout(() => {
+                document.getElementById('lhm-setup')?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+              }, 100);
+            });
+          }}
           style={{
             padding: '4px 14px',
             background: 'hsl(38 80% 45%)',
