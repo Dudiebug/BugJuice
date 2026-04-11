@@ -42,13 +42,18 @@ pub fn is_available() -> bool {
     LHM_AVAILABLE.load(Ordering::Relaxed)
 }
 
-/// Direct WMI availability check, bypassing the cache. Used by
-/// lhm_setup::lhm_verify after the user completes setup.
+/// Direct WMI availability check, bypassing AND updating the cache.
+/// Used by lhm_setup::lhm_verify after the user completes setup.
+/// Updates LHM_AVAILABLE so the polling thread picks up LHM data
+/// on the very next tick instead of waiting up to 60 seconds.
 pub fn check_now() -> bool {
     if cfg!(target_arch = "aarch64") {
         return false;
     }
-    query_lhm_wmi().is_some()
+    let available = query_lhm_wmi().is_some();
+    LHM_AVAILABLE.store(available, Ordering::Relaxed);
+    LHM_CHECKED.store(true, Ordering::Relaxed);
+    available
 }
 
 /// State held across ticks for retry logic.

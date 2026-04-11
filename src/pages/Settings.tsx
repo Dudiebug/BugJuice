@@ -254,7 +254,7 @@ export function Settings() {
       </section>
 
       {/* ─── LibreHardwareMonitor (x64 only) ────────────────────────── */}
-      {lhm && lhm.needed && <LhmSetupSection
+      {lhm && lhm.needed && !lhm.running && <LhmSetupSection
         lhm={lhm}
         step={lhmStep}
         error={lhmError}
@@ -322,7 +322,7 @@ export function Settings() {
         }}
       />}
 
-      {lhm && !lhm.needed && lhm.running && <section className="card">
+      {lhm && lhm.running && <section className="card" id="lhm-setup">
         <div className="card-header">
           <div>
             <div className="card-title">LibreHardwareMonitor</div>
@@ -332,7 +332,7 @@ export function Settings() {
         </div>
       </section>}
 
-      {lhm && !lhm.needed && lhm.installed && !lhm.running && <section className="card">
+      {lhm && !lhm.running && lhm.installed && !lhm.needed && <section className="card" id="lhm-setup">
         <div className="card-header">
           <div>
             <div className="card-title">LibreHardwareMonitor</div>

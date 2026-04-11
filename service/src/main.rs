@@ -68,6 +68,19 @@ struct PipeResponse {
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
+
+    // Diagnostic: always print something so we can verify the binary runs.
+    if args.len() > 1 {
+        eprintln!(
+            "[bugjuice-svc] v{} ({}) — args: {:?}",
+            env!("CARGO_PKG_VERSION"),
+            if cfg!(target_arch = "x86_64") { "x64" }
+            else if cfg!(target_arch = "aarch64") { "arm64" }
+            else { "unknown" },
+            &args[1..],
+        );
+    }
+
     match args.get(1).map(|s| s.as_str()) {
         Some("install") => install_service(),
         Some("uninstall") => uninstall_service(),
