@@ -286,19 +286,24 @@ fn tick(state: &mut PollState) {
     }
 
     // Power channels via the bugjuice-service named pipe. The service runs
-    // as SYSTEM and reads EMI devices that require elevation. If the service
-    // isn't running, read_emi() returns an empty vec — we just skip power
-    // channels and the rest of the app (battery, CPU, GPU) still works.
+    // as SYSTEM and reads EMI devices that require elevation, plus LHM data
+    // from the helper process. Readings with oem="LHM" come from the LHM
+    // helper. If the service isn't running, read_emi() returns an empty vec —
+    // we just skip power channels and the rest of the app still works.
     let mut cpu_package_watts: Option<f64> = None;
     let mut gpu_package_watts: Option<f64> = None;
     if let Ok(readings) = crate::pipe_client::read_emi() {
         for r in readings {
+            let is_lhm = r.oem.eq_ignore_ascii_case("lhm");
+            let prefix = if is_lhm { "lhm_" } else { "" };
+            let source = if is_lhm { "lhm" } else { "emi" };
+
             for ch in &r.channels {
                 batch.push(ReadingInput {
-                    name: format!("power_{}", sanitize(&ch.name)),
+                    name: format!("power_{}{}", prefix, sanitize(&ch.name)),
                     unit: "W",
                     category: "power",
-                    hw_source: Some("emi"),
+                    hw_source: Some(source),
                     value: ch.watts,
                 });
                 let upper = ch.name.to_ascii_uppercase();

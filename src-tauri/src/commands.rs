@@ -193,9 +193,10 @@ pub struct PowerReadingDto {
 #[tauri::command]
 pub fn get_power_reading() -> Result<PowerReadingDto, String> {
     // Read EMI data from the bugjuice-service via named pipe. The service
-    // runs as SYSTEM and handles the privileged EMI reads.
+    // runs as SYSTEM and handles the privileged EMI reads. The service may
+    // return multiple readings (EMI + LHM helper), so we merge them all.
     match crate::pipe_client::read_emi() {
-        Ok(readings) if !readings.is_empty() => Ok(power_dto_from_emi(&readings[0])),
+        Ok(readings) if !readings.is_empty() => Ok(power_dto_merged(&readings)),
         Ok(_) => Ok(PowerReadingDto {
             wall_input_w: None,
             system_draw_w: None,
@@ -214,6 +215,81 @@ pub fn get_power_reading() -> Result<PowerReadingDto, String> {
             source: format!("EMI error: {e}"),
             channels: vec![],
         }),
+    }
+}
+
+/// Merge all readings from the pipe (EMI + LHM helper) into one DTO.
+/// LHM channels are prefixed with `power_lhm_` so the frontend can detect
+/// enhanced mode. LHM values fill gaps where EMI has no data.
+fn power_dto_merged(readings: &[EmiReading]) -> PowerReadingDto {
+    // Partition into EMI vs LHM readings by OEM field.
+    let mut emi_readings: Vec<&EmiReading> = Vec::new();
+    let mut lhm_readings: Vec<&EmiReading> = Vec::new();
+    for r in readings {
+        if r.oem.eq_ignore_ascii_case("lhm") {
+            lhm_readings.push(r);
+        } else {
+            emi_readings.push(r);
+        }
+    }
+
+    let emi_dto = emi_readings.first().map(|r| power_dto_from_emi(r));
+    let lhm_dto = lhm_readings.first().map(|r| power_dto_from_emi(r));
+
+    // Build merged channels: EMI raw + LHM with prefix.
+    let mut channels: Vec<PowerChannelDto> = Vec::new();
+    for r in &emi_readings {
+        for ch in &r.channels {
+            channels.push(PowerChannelDto {
+                name: ch.name.clone(),
+                watts: ch.watts,
+            });
+        }
+    }
+    for r in &lhm_readings {
+        for ch in &r.channels {
+            channels.push(PowerChannelDto {
+                name: format!("power_lhm_{}", ch.name),
+                watts: ch.watts,
+            });
+        }
+    }
+
+    // Merge power values: EMI first, LHM fills gaps.
+    let (cpu, gpu, dram, sys, input, base_source) = match (&emi_dto, &lhm_dto) {
+        (Some(e), Some(l)) => (
+            e.cpu_package_w.or(l.cpu_package_w),
+            e.gpu_w.or(l.gpu_w),
+            e.dram_w.or(l.dram_w),
+            e.system_draw_w.or(l.system_draw_w),
+            e.wall_input_w.or(l.wall_input_w),
+            e.source.clone(),
+        ),
+        (Some(e), None) => (
+            e.cpu_package_w, e.gpu_w, e.dram_w, e.system_draw_w, e.wall_input_w,
+            e.source.clone(),
+        ),
+        (None, Some(l)) => (
+            l.cpu_package_w, l.gpu_w, l.dram_w, l.system_draw_w, l.wall_input_w,
+            l.source.clone(),
+        ),
+        (None, None) => (None, None, None, None, None, "no data".to_string()),
+    };
+
+    let source = if lhm_dto.is_some() {
+        format!("{} + LibreHardwareMonitor", base_source)
+    } else {
+        base_source
+    };
+
+    PowerReadingDto {
+        wall_input_w: input,
+        system_draw_w: sys,
+        cpu_package_w: cpu,
+        gpu_w: gpu,
+        dram_w: dram,
+        source,
+        channels,
     }
 }
 
