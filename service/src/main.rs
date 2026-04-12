@@ -8,6 +8,7 @@
 #![allow(unsafe_op_in_unsafe_fn)]
 
 mod emi;
+mod lhm_helper;
 
 use std::ffi::c_void;
 use std::mem::{size_of, zeroed};
@@ -202,6 +203,8 @@ unsafe extern "system" fn service_main(_argc: u32, _argv: *mut windows::core::PW
 
     // Shared EMI data: polled by the EMI thread, read by the pipe thread.
     let emi_data: Arc<Mutex<Vec<EmiReading>>> = Arc::new(Mutex::new(Vec::new()));
+    // Shared LHM data: polled by the LHM helper thread, read by the pipe thread.
+    let lhm_data: Arc<Mutex<Vec<EmiReading>>> = Arc::new(Mutex::new(Vec::new()));
 
     // EMI polling thread — reads every 2 seconds.
     let emi_clone = emi_data.clone();
@@ -212,11 +215,22 @@ unsafe extern "system" fn service_main(_argc: u32, _argv: *mut windows::core::PW
         eprintln!("[service] failed to spawn EMI poll thread: {e}");
     }
 
-    // Named pipe server thread.
-    let pipe_clone = emi_data.clone();
+    // LHM helper thread (x64 only) — spawns bugjuice-lhm.exe and reads
+    // power sensor data from its stdout. On ARM64 this is a no-op.
+    let lhm_clone = lhm_data.clone();
+    if let Err(e) = std::thread::Builder::new()
+        .name("lhm-helper".into())
+        .spawn(move || lhm_helper::run(lhm_clone, &SHUTDOWN))
+    {
+        eprintln!("[service] failed to spawn LHM helper thread: {e}");
+    }
+
+    // Named pipe server thread — serves merged EMI + LHM data.
+    let pipe_emi = emi_data.clone();
+    let pipe_lhm = lhm_data.clone();
     if let Err(e) = std::thread::Builder::new()
         .name("pipe-server".into())
-        .spawn(move || pipe_server_loop(pipe_clone))
+        .spawn(move || pipe_server_loop_merged(pipe_emi, pipe_lhm))
     {
         eprintln!("[service] failed to spawn pipe server thread: {e}");
     }
@@ -293,11 +307,11 @@ fn emi_poll_loop(data: Arc<Mutex<Vec<EmiReading>>>) {
 
 // ─── Named pipe server ──────────────────────────────────────────────────────
 
-fn pipe_server_loop(data: Arc<Mutex<Vec<EmiReading>>>) {
+fn pipe_server_loop_merged(
+    emi_data: Arc<Mutex<Vec<EmiReading>>>,
+    lhm_data: Arc<Mutex<Vec<EmiReading>>>,
+) {
     while !SHUTDOWN.load(Ordering::Relaxed) {
-        // Create a new pipe instance with NULL DACL so non-admin clients
-        // can connect. This is CRITICAL — without it, the Tauri app
-        // (running as normal user) gets ACCESS_DENIED.
         let pipe = match create_pipe() {
             Ok(h) => h,
             Err(e) => {
@@ -307,7 +321,6 @@ fn pipe_server_loop(data: Arc<Mutex<Vec<EmiReading>>>) {
             }
         };
 
-        // Wait for a client to connect.
         unsafe {
             let result = ConnectNamedPipe(pipe, None);
             let connected = result.is_ok()
@@ -318,20 +331,22 @@ fn pipe_server_loop(data: Arc<Mutex<Vec<EmiReading>>>) {
             }
         }
 
-        // Read command from client (up to 256 bytes).
         let mut cmd_buf = [0u8; 256];
         let mut cmd_len: u32 = 0;
         unsafe {
             let _ = ReadFile(pipe, Some(&mut cmd_buf), Some(&mut cmd_len), None);
         }
 
-        // Parse command and build response.
         let cmd = std::str::from_utf8(&cmd_buf[..cmd_len as usize])
             .unwrap_or("")
             .trim();
 
         let response = if cmd.contains("read_emi") {
-            let readings = data.lock().map(|d| d.clone()).unwrap_or_default();
+            // Merge EMI + LHM readings into a single response.
+            let mut readings = emi_data.lock().map(|d| d.clone()).unwrap_or_default();
+            if let Ok(lhm) = lhm_data.lock() {
+                readings.extend(lhm.iter().cloned());
+            }
             PipeResponse {
                 ok: true,
                 readings: Some(readings),

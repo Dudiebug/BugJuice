@@ -11,7 +11,6 @@ import {
   getBatteryHistory,
   getBatteryStatus,
   getChargeSpeed,
-  getLhmStatus,
   getPowerReading,
   getTopApps,
   getUnplugEstimate,
@@ -22,7 +21,6 @@ import { useApi } from '@/hooks/useApi';
 export function Dashboard() {
   const status = useApi(getBatteryStatus, 2000);
   const power = useApi(getPowerReading, 2000);
-  const lhm = useApi(getLhmStatus, 60_000);
   const appsResponse = useApi(getTopApps, 2000);
   const chargeSpeed = useApi(getChargeSpeed, 5000);
   const unplugEstimate = useApi(getUnplugEstimate, 10_000);
@@ -185,20 +183,18 @@ export function Dashboard() {
 
       {/* ─── Power breakdown ──────────────────────────────────────────── */}
       <section className="grid grid-4">
-        <PowerCard title="Wall input" watts={power.wallInputW} sub="from charger" needsSetup={lhm?.needed} />
+        <PowerCard title="Wall input" watts={power.wallInputW} sub="from charger" />
         <PowerCard
           title="System draw"
           watts={power.systemDrawW}
           sub="whole laptop"
-          needsSetup={lhm?.needed}
         />
         <PowerCard
           title="CPU package"
           watts={power.cpuPackageW}
           sub={power.source.startsWith('Microsoft') ? 'RAPL via PPM' : 'EMI CPU clusters'}
-          needsSetup={lhm?.needed}
         />
-        <PowerCard title="GPU" watts={power.gpuW} sub="integrated" needsSetup={lhm?.needed} />
+        <PowerCard title="GPU" watts={power.gpuW} sub="integrated" />
       </section>
 
       {/* ─── Battery history chart ────────────────────────────────────── */}
@@ -332,12 +328,10 @@ function PowerCard({
   title,
   watts,
   sub,
-  needsSetup,
 }: {
   title: string;
   watts: number | null;
   sub: string;
-  needsSetup?: boolean;
 }) {
   return (
     <div className="card">
@@ -360,25 +354,7 @@ function PowerCard({
             —
           </div>
           <div className="stat-context" style={{ marginTop: 4 }}>
-            {needsSetup ? (
-              <a
-                href="#/settings"
-                onClick={(e) => {
-                  e.preventDefault();
-                  window.location.hash = '#/settings';
-                  requestAnimationFrame(() => {
-                    setTimeout(() => {
-                      document.getElementById('lhm-setup')?.scrollIntoView({ behavior: 'smooth', block: 'start' });
-                    }, 100);
-                  });
-                }}
-                style={{ color: 'var(--accent)', textDecoration: 'none' }}
-              >
-                needs setup
-              </a>
-            ) : (
-              'not reported'
-            )}
+            not reported
           </div>
         </>
       )}

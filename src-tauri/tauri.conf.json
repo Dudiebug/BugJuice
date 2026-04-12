@@ -40,7 +40,7 @@
   "bundle": {
     "active": true,
     "targets": ["nsis"],
-    "resources": ["bugjuice-svc.exe"],
+    "resources": ["bugjuice-svc.exe", "bugjuice-lhm.exe"],
     "publisher": "DudieBug",
     "category": "Utility",
     "shortDescription": "Battery monitoring and analytics for Windows",

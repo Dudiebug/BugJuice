@@ -43,7 +43,6 @@ pub fn is_available() -> bool {
 }
 
 /// Direct WMI availability check, bypassing AND updating the cache.
-/// Used by lhm_setup::lhm_verify after the user completes setup.
 /// Updates LHM_AVAILABLE so the polling thread picks up LHM data
 /// on the very next tick instead of waiting up to 60 seconds.
 pub fn check_now() -> bool {

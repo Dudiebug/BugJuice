@@ -404,66 +404,6 @@ export async function setNotificationPrefs(prefs: NotificationPrefsInput): Promi
   return safe('set_notification_prefs', undefined, { prefs });
 }
 
-// ─── LHM Setup ────────────────────────────────────────────────────────
-
-export interface LhmStatus {
-  needed: boolean;
-  running: boolean;
-  installed: boolean;
-  autoStartEnabled: boolean;
-  lhmDir: string;
-  hasEmi: boolean;
-  serviceRunning: boolean;
-}
-
-const EMPTY_LHM_STATUS: LhmStatus = {
-  needed: false,
-  running: false,
-  installed: false,
-  autoStartEnabled: false,
-  lhmDir: '',
-  hasEmi: false,
-  serviceRunning: false,
-};
-
-export async function getLhmStatus(): Promise<LhmStatus> {
-  return safe('get_lhm_status', EMPTY_LHM_STATUS);
-}
-
-export interface LhmDownloadResult {
-  success: boolean;
-  zipPath: string;
-  error: string | null;
-}
-
-export async function lhmDownload(): Promise<LhmDownloadResult> {
-  return safe('lhm_download', { success: false, zipPath: '', error: 'not available' });
-}
-
-export async function lhmFindDownload(): Promise<string | null> {
-  if (!inTauri()) return null;
-  try {
-    return await tauriInvoke<string | null>('lhm_find_download');
-  } catch {
-    return null;
-  }
-}
-
-export interface LhmInstallResult {
-  success: boolean;
-  exePath: string;
-  error: string | null;
-}
-
-export async function lhmInstall(zipPath?: string): Promise<LhmInstallResult> {
-  return safe('lhm_install', { success: false, exePath: '', error: 'not available' },
-    zipPath ? { zipPath } : undefined);
-}
-
-export async function lhmVerify(): Promise<boolean> {
-  return safe('lhm_verify', false);
-}
-
 // Convenience: returns true if we're connected to the real Rust backend.
 export function isLive(): boolean {
   return inTauri();
