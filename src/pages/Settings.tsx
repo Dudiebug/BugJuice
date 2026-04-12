@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react';
 import { enableAutostart, disableAutostart, isAutostartEnabled, setStartMinimized, getStartMinimized, setNotificationPrefs, setDataRetention, exportReportJson, exportReportPdf, getPowerPlanStatus, setPowerPlanConfig } from '@/api';
 import type { PowerPlanStatus } from '@/api';
+import { openUrl } from '@tauri-apps/plugin-opener';
 
 // Static example data for the notification preview. This is a design
 // preview only — the real notification in the tray uses live data.
@@ -545,18 +546,16 @@ export function Settings() {
           </div>
           <div style={{ marginTop: 12, display: 'flex', gap: 20 }}>
             <a
-              href="https://github.com/Dudiebug/BugJuice"
-              style={{ color: 'var(--accent)' }}
-              target="_blank"
-              rel="noreferrer"
+              href="#"
+              onClick={(e) => { e.preventDefault(); openUrl('https://github.com/Dudiebug/BugJuice'); }}
+              style={{ color: 'var(--accent)', cursor: 'pointer' }}
             >
               GitHub →
             </a>
             <a
-              href="https://dudiebug.net/bugjuice"
-              style={{ color: 'var(--accent)' }}
-              target="_blank"
-              rel="noreferrer"
+              href="#"
+              onClick={(e) => { e.preventDefault(); openUrl('https://dudiebug.net'); }}
+              style={{ color: 'var(--accent)', cursor: 'pointer' }}
             >
               Website →
             </a>
