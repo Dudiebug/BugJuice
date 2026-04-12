@@ -182,24 +182,29 @@ export function Dashboard() {
       )}
 
       {/* ─── Power breakdown ──────────────────────────────────────────── */}
-      <section className="grid grid-4">
-        <PowerCard
-          title="Charge rate"
-          watts={rateKnown ? rateAbs : null}
-          sub={charging ? 'into battery' : status.onAc ? 'on AC' : 'from battery'}
-        />
-        <PowerCard
-          title="System draw"
-          watts={power.systemDrawW}
-          sub={power.systemDrawW ? 'SoC platform (excl. display)' : 'on battery only'}
-        />
-        <PowerCard
-          title="CPU package"
-          watts={power.cpuPackageW}
-          sub={power.source.startsWith('Microsoft') ? 'RAPL via PPM' : 'EMI CPU clusters'}
-        />
-        <PowerCard title="GPU" watts={power.gpuW} sub="integrated" />
-      </section>
+      {(() => {
+        const cards: { title: string; watts: number | null; sub: string }[] = [];
+        if (power.wallInputW != null) {
+          cards.push({ title: 'Wall input', watts: power.wallInputW, sub: 'from charger' });
+        } else if (rateKnown) {
+          cards.push({
+            title: charging ? 'Charge rate' : 'Discharge rate',
+            watts: rateAbs,
+            sub: charging ? 'from charger' : 'battery drain',
+          });
+        }
+        if (power.systemDrawW != null) cards.push({ title: 'System draw', watts: power.systemDrawW, sub: 'whole laptop' });
+        if (power.cpuPackageW != null) cards.push({ title: 'CPU package', watts: power.cpuPackageW, sub: power.source.startsWith('Microsoft') ? 'RAPL via PPM' : 'EMI CPU clusters' });
+        if (power.gpuW != null) cards.push({ title: 'GPU', watts: power.gpuW, sub: 'integrated' });
+        if (cards.length === 0) return null;
+        return (
+          <section className={`grid grid-${Math.min(cards.length, 4) as 2 | 3 | 4}`}>
+            {cards.map((c) => (
+              <PowerCard key={c.title} title={c.title} watts={c.watts} sub={c.sub} />
+            ))}
+          </section>
+        );
+      })()}
 
       {/* ─── Battery history chart ────────────────────────────────────── */}
       <section className="card">

@@ -28,3 +28,4 @@ vite.config.d.ts
 Thumbs.db
 .DS_Store
 src-tauri/bugjuice-svc.exe
+src-tauri/bugjuice-lhm.exe

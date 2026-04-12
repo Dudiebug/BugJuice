@@ -22,7 +22,12 @@ type ViewMode = 'week' | 'day' | 'custom';
 
 export function Sessions() {
   const [viewMode, setViewMode] = useState<ViewMode>('week');
-  const [weekStart, setWeekStart] = useState<Date>(() => getLastSunday(new Date()));
+  const [weekStart, setWeekStart] = useState<Date>(() => {
+    const d = new Date();
+    d.setHours(0, 0, 0, 0);
+    d.setDate(d.getDate() - 6);
+    return d;
+  });
   const [selectedDay, setSelectedDay] = useState<Date | null>(null);
   const [customStart, setCustomStart] = useState('');
   const [customEnd, setCustomEnd] = useState('');
@@ -98,6 +103,13 @@ export function Sessions() {
     () => computeStats(batterySessions, sleepSessions),
     [batterySessions, sleepSessions],
   );
+
+  // Prevent navigating forward past the current rolling window
+  const isAtCurrentWeek = useMemo(() => {
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+    return weekStart >= addDays(today, -6);
+  }, [weekStart]);
 
   // Unified session list (sorted newest first)
   const allSessions = useMemo(() => {
@@ -192,8 +204,17 @@ export function Sessions() {
               <span style={{ fontWeight: 500, fontSize: 14 }}>{formatWeekRange(weekStart)}</span>
               <button
                 className="btn btn-ghost"
-                onClick={() => setWeekStart((prev) => addDays(prev, 7))}
+                onClick={() => {
+                  setWeekStart((prev) => {
+                    const next = addDays(prev, 7);
+                    const today = new Date();
+                    today.setHours(0, 0, 0, 0);
+                    const maxStart = addDays(today, -6);
+                    return next > maxStart ? maxStart : next;
+                  });
+                }}
                 style={ghostBtnStyle}
+                disabled={isAtCurrentWeek}
               >
                 {'>'}
               </button>
@@ -1011,13 +1032,6 @@ function computeStats(
   }
 
   return { timeOnBatterySec, avgDrainW, peakDrainW, totalSleepDrainMwh };
-}
-
-function getLastSunday(d: Date): Date {
-  const result = new Date(d);
-  result.setDate(result.getDate() - result.getDay());
-  result.setHours(0, 0, 0, 0);
-  return result;
 }
 
 function addDays(d: Date, n: number): Date {

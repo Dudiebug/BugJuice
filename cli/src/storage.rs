@@ -325,39 +325,6 @@ impl Storage {
         Ok(())
     }
 
-    // ── App power ─────────────────────────────────────────────────────────────
-
-    /// Insert per-app power attributions for one polling tick. Single
-    /// transaction so each tick is one fsync regardless of process count.
-    pub fn log_app_power_batch(&self, rows: &[AppPowerRow]) -> SqlResult<()> {
-        if rows.is_empty() {
-            return Ok(());
-        }
-        let mut conn = self.conn.lock().unwrap();
-        let ts = now_unix();
-        let tx = conn.transaction()?;
-        {
-            let mut insert = tx.prepare_cached(
-                "INSERT INTO app_power
-                 (ts, process_name, cpu_watts, gpu_watts, disk_watts, net_watts, total_watts)
-                 VALUES (?, ?, ?, ?, ?, ?, ?)",
-            )?;
-            for r in rows {
-                insert.execute(params![
-                    ts,
-                    r.process_name,
-                    r.cpu_watts,
-                    r.gpu_watts,
-                    r.disk_watts,
-                    r.net_watts,
-                    r.total_watts,
-                ])?;
-            }
-        }
-        tx.commit()?;
-        Ok(())
-    }
-
     // ── Sleep sessions ────────────────────────────────────────────────────────
 
     /// Start a sleep session on PBT_APMSUSPEND. Returns the new row id.
@@ -437,14 +404,12 @@ impl Storage {
         let health: i64 =
             conn.query_row("SELECT COUNT(*) FROM health_snapshots", [], |r| r.get(0))?;
         let sensors: i64 = conn.query_row("SELECT COUNT(*) FROM sensors", [], |r| r.get(0))?;
-        let app_power: i64 = conn.query_row("SELECT COUNT(*) FROM app_power", [], |r| r.get(0))?;
         Ok(RowCounts {
             readings,
             battery_sessions: sessions,
             sleep_sessions: sleeps,
             health_snapshots: health,
             sensors,
-            app_power,
         })
     }
 }
@@ -455,7 +420,6 @@ pub struct RowCounts {
     pub sleep_sessions: i64,
     pub health_snapshots: i64,
     pub sensors: i64,
-    pub app_power: i64,
 }
 
 /// One sensor reading queued for batch insert.
@@ -465,18 +429,6 @@ pub struct ReadingInput<'a> {
     pub category: &'a str,
     pub hw_source: Option<&'a str>,
     pub value: f64,
-}
-
-/// One row of per-process power attribution for the app_power table.
-/// Per-component fields are optional so we can fill them in as the
-/// estimation engine grows (CPU first, GPU/disk/net later).
-pub struct AppPowerRow {
-    pub process_name: String,
-    pub cpu_watts: Option<f64>,
-    pub gpu_watts: Option<f64>,
-    pub disk_watts: Option<f64>,
-    pub net_watts: Option<f64>,
-    pub total_watts: Option<f64>,
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────

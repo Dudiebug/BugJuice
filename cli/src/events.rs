@@ -9,7 +9,6 @@
 
 use std::ffi::c_void;
 use std::ptr;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -71,15 +70,6 @@ static SLEEP_STATE: OnceLock<Mutex<SleepState>> = OnceLock::new();
 
 fn sleep_state() -> &'static Mutex<SleepState> {
     SLEEP_STATE.get_or_init(|| Mutex::new(SleepState::Awake))
-}
-
-/// Current display state, updated by the GUID_CONSOLE_DISPLAY_STATE
-/// callback. True = display on, false = display off/dimmed. The polling
-/// loop reads this to decide on adaptive intervals.
-static DISPLAY_ON: AtomicBool = AtomicBool::new(true);
-
-pub fn is_display_on() -> bool {
-    DISPLAY_ON.load(Ordering::Relaxed)
 }
 
 // ─── Timestamp helper ─────────────────────────────────────────────────────────
@@ -147,12 +137,6 @@ unsafe extern "system" fn suspend_resume_callback(
     0 // ERROR_SUCCESS
 }
 
-/// Sleep sessions shorter than this get no drain rate / verdict — the
-/// EC fuel gauge has ~5-10 mWh of jitter per reading, and below this
-/// threshold the drain signal is indistinguishable from noise. We still
-/// log the raw pre/post values and persist the row.
-const MIN_RELIABLE_SLEEP_SECS: f64 = 60.0;
-
 fn measure_sleep_drain(baseline_mwh: u32, at: SystemTime, sleep_row_id: Option<i64>) {
     // Battery readings are stale for 2-5s after resume — give EC time.
     std::thread::sleep(std::time::Duration::from_secs(3));
@@ -165,30 +149,19 @@ fn measure_sleep_drain(baseline_mwh: u32, at: SystemTime, sleep_row_id: Option<i
         }
     };
 
-    let duration_s = SystemTime::now()
+    let duration_h = SystemTime::now()
         .duration_since(at)
-        .map(|d| d.as_secs_f64())
+        .map(|d| d.as_secs_f64() / 3600.0)
         .unwrap_or(0.0);
-    let duration_h = duration_s / 3600.0;
     let drain_mwh = baseline_mwh as i64 - post_cap as i64;
+
+    if duration_h < 0.0008 {
+        return;
+    }
 
     println!("  slept for {}", super::format_hours(duration_h));
     println!("  pre:  {baseline_mwh} mWh");
     println!("  post: {post_cap} mWh");
-
-    // Below the reliability threshold, show raw numbers only. Fuel-gauge
-    // noise dominates, so publishing a "drain rate" would mislead.
-    if duration_s < MIN_RELIABLE_SLEEP_SECS {
-        println!(
-            "  raw delta: {drain_mwh} mWh  (too short for a reliable rate — need ≥ {:.0}s)",
-            MIN_RELIABLE_SLEEP_SECS
-        );
-        if let (Some(id), Some(storage)) = (sleep_row_id, crate::storage::global()) {
-            // Persist the session with pre/post only — no computed rate.
-            let _ = storage.finish_sleep_session(id, Some(post_cap), None, None, None);
-        }
-        return;
-    }
 
     let (drain_print, rate_mw_opt, pct_opt) = if drain_mwh <= 0 {
         println!("  drain: none (charging while asleep?)");
@@ -210,6 +183,7 @@ fn measure_sleep_drain(baseline_mwh: u32, at: SystemTime, sleep_row_id: Option<i
         (Some(drain_mwh), Some(rate_mw), Some(pct))
     };
 
+    // Persist results to the sleep_sessions row we started earlier.
     if let (Some(id), Some(storage)) = (sleep_row_id, crate::storage::global()) {
         let _ = storage.finish_sleep_session(
             id,
@@ -247,9 +221,6 @@ unsafe extern "system" fn power_setting_callback(
             println!("[{}] battery: {val}%", timestamp());
         } else if guid == GUID_CONSOLE_DISPLAY_STATE {
             // val: 0=off, 1=on, 2=dimmed
-            // Update global display state for the polling loop.
-            DISPLAY_ON.store(val == 1, Ordering::Relaxed);
-
             if val == 1 {
                 // Display turned on. If we're in an active sleep session,
                 // this is the real user wake — measure drain now.

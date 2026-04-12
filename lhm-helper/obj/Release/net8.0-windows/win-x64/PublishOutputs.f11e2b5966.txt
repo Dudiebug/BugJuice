@@ -1,0 +1,2 @@
+C:\Users\dudie\Documents\A Folder With Real Documents\Tech & Dev\Source Code\BugJuice\lhm-helper\bin\Release\net8.0-windows\win-x64\publish\bugjuice-lhm.pdb
+C:\Users\dudie\Documents\A Folder With Real Documents\Tech & Dev\Source Code\BugJuice\lhm-helper\bin\Release\net8.0-windows\win-x64\publish\bugjuice-lhm.exe

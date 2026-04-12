@@ -219,6 +219,9 @@ export function Health() {
                   / 100 — {habits.verdict}
                 </span>
               </div>
+              <div style={{ fontSize: 12, color: 'var(--text-muted)', marginTop: 4 }}>
+                Based on the last 30 days of charging data
+              </div>
 
               {/* Provisional warning */}
               {habits.isProvisional && (

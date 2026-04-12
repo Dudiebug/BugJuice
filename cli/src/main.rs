@@ -5,19 +5,12 @@
 //   bugjuice-cli --watch      → probe + live monitoring + background polling
 //                               into SQLite (sleep/wake drain, AC/DC, 1% events,
 //                               5-second sensor logging)
-//   bugjuice-cli --live       → real-time dashboard refreshing every 2s,
-//                               also writes to SQLite in the background
 //   bugjuice-cli --stats      → print row counts from the local database
-//   bugjuice-cli --top        → snapshot processes, wait 2s, snapshot again,
-//                               print top 15 CPU consumers
 
 mod battery;
 mod events;
-mod gpu;
-mod live;
 mod polling;
 mod power;
-mod processes;
 mod storage;
 
 use battery::{
@@ -29,8 +22,6 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
     let watch = args.iter().any(|a| a == "--watch" || a == "-w");
     let stats = args.iter().any(|a| a == "--stats");
-    let top = args.iter().any(|a| a == "--top");
-    let live = args.iter().any(|a| a == "--live" || a == "-l");
 
     // Initialize storage early so even one-shot runs can log a health
     // snapshot. Failure here is non-fatal — we just print a warning.
@@ -41,21 +32,6 @@ fn main() {
 
     if stats {
         print_stats(&db_path);
-        return;
-    }
-
-    if top {
-        print_top_processes();
-        return;
-    }
-
-    if live {
-        // Start the background polling thread so data continues to
-        // persist to SQLite while the user watches the dashboard.
-        enable_ecoqos();
-        polling::spawn();
-        let _handles = events::register().ok();
-        live::run();
         return;
     }
 
@@ -130,89 +106,6 @@ fn main() {
     }
 }
 
-fn print_top_processes() {
-    use std::time::Duration;
-
-    println!("BugJuice — top processes by CPU");
-    println!("===============================");
-    println!("Sampling for 2 seconds...\n");
-
-    let prev_procs = match processes::snapshot_processes() {
-        Ok(p) => p,
-        Err(e) => {
-            eprintln!("Error: {e}");
-            return;
-        }
-    };
-    let prev_cpu = match processes::snapshot_processor_totals() {
-        Ok(t) => t,
-        Err(e) => {
-            eprintln!("Error: {e}");
-            return;
-        }
-    };
-
-    std::thread::sleep(Duration::from_secs(2));
-
-    let curr_procs = match processes::snapshot_processes() {
-        Ok(p) => p,
-        Err(e) => {
-            eprintln!("Error: {e}");
-            return;
-        }
-    };
-    let curr_cpu = match processes::snapshot_processor_totals() {
-        Ok(t) => t,
-        Err(e) => {
-            eprintln!("Error: {e}");
-            return;
-        }
-    };
-
-    let deltas = processes::compute_deltas(&prev_procs, &curr_procs, &prev_cpu, &curr_cpu);
-    let idle_pct = processes::idle_fraction(&prev_cpu, &curr_cpu) * 100.0;
-    let busy_pct = 100.0 - idle_pct;
-
-    let n_cpus = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(1);
-    println!(
-        "{} CPUs · {:.1}% idle · {:.1}% busy · {} processes had CPU activity\n",
-        n_cpus,
-        idle_pct,
-        busy_pct,
-        deltas.len()
-    );
-    println!(
-        "{:<6}  {:<32}  {:>10}  {:>10}",
-        "PID", "PROCESS", "% OF BUSY", "CPU TIME"
-    );
-    println!("{}", "─".repeat(64));
-
-    for d in deltas.iter().take(15) {
-        // CPU time across all cores during the 2s window, in milliseconds.
-        let cpu_ms = d.cpu_100ns / 10_000;
-        let name = if d.name.chars().count() > 32 {
-            format!("{}…", d.name.chars().take(31).collect::<String>())
-        } else {
-            d.name.clone()
-        };
-        println!(
-            "{:<6}  {:<32}  {:>9.1}%  {:>8} ms",
-            d.pid,
-            name,
-            d.share * 100.0,
-            cpu_ms
-        );
-    }
-
-    let top_n_share: f64 = deltas.iter().take(15).map(|d| d.share).sum();
-    println!(
-        "\nTop 15 account for {:.1}% of all busy CPU time.",
-        top_n_share * 100.0
-    );
-}
-
 fn print_stats(db_path: &std::path::Path) {
     println!("BugJuice — database stats");
     println!("=========================");
@@ -228,7 +121,6 @@ fn print_stats(db_path: &std::path::Path) {
             println!("  battery sessions:  {}", c.battery_sessions);
             println!("  sleep sessions:    {}", c.sleep_sessions);
             println!("  health snapshots:  {}", c.health_snapshots);
-            println!("  app power rows:    {}", c.app_power);
         }
         Err(e) => println!("(query failed: {e})"),
     }

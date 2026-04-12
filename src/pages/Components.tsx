@@ -73,7 +73,9 @@ export function Components() {
       <header className="page-header">
         <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
           <h1 className="page-title">Components</h1>
-          {hasLhm && <span className="badge badge-ok">enhanced</span>}
+          {hasLhm
+            ? <span className="badge badge-ok">enhanced</span>
+            : <span className="badge badge-warn">basic</span>}
         </div>
         <p className="page-subtitle">
           Power breakdown by subsystem · {power.source}

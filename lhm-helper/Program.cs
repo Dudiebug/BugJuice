@@ -105,11 +105,6 @@ static string? MapSensorName(ISensor sensor)
     if (name.Contains("cpu cores") || name == "cores")
         return "RAPL_Package0_PP0";
 
-    // Intel PSys / Platform — whole-SoC power (Skylake mobile 6th gen+)
-    // commands.rs:238 maps "PSYS" to system_draw_w automatically
-    if (name.Contains("cpu platform") || name.Contains("platform"))
-        return "PSYS";
-
     // GPU power (discrete or integrated)
     if (name.Contains("gpu power") || name.Contains("gpu package"))
         return "GPU";

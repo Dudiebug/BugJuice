@@ -1,61 +1,64 @@
 # BugJuice
 
-**Battery monitoring and analytics for Windows.** Real-time wattage, per-app power attribution, sleep drain analysis, battery health trending — all with plain-english context, no raw numbers without explanation.
+**Battery monitoring and power analytics for Windows laptops.** Real-time wattage, per-app power attribution, component breakdown, sleep drain analysis, battery health trending, and charge habit scoring — all with plain-english context instead of raw numbers.
 
-Built by [DudieBug](https://github.com/Dudiebug). Free and open source.
+Built by [DudieBug](https://github.com/Dudiebug). Free and open source (MIT).
 
 <!-- ![BugJuice Dashboard](docs/screenshot-dashboard.png) -->
 
 ## Features
 
-- **Real-time dashboard** — battery percentage, charge/discharge rate in watts, time remaining, voltage, temperature
-- **Per-app power rankings** — see which processes drain the most battery, with confidence scoring
-- **Component breakdown** — CPU, GPU, DRAM, modem, and NPU power via pie chart and stacked area chart
-- **Battery health tracking** — wear curve over months, cycle count, projected lifespan
-- **Charge habit scoring** — 0-100 score based on your charging patterns, with actionable tips
-- **Sleep drain detection** — measures battery loss during sleep, flags abnormal drain
-- **Session logging** — every unplug-to-plug cycle tracked with detailed drill-down
-- **Charge speed tracking** — current, peak, and average charge rate while plugged in
-- **"Before I unplug" estimate** — predicted battery life per-app based on current usage
-- **Power plan auto-switching** — automatically switch Windows power plan at configurable battery thresholds
-- **Smart notifications** — charge limit alerts, low battery warnings, periodic summaries, sleep drain alerts
-- **Export** — full reports in JSON and PDF
-- **Auto-updater** — Ed25519-signed updates from GitHub Releases
-- **System tray** — battery percentage tooltip, quick actions, minimize to tray on close
-- **Light and dark theme** — follows Windows system preference, with accent color integration
+| Category | What you get |
+|----------|-------------|
+| **Dashboard** | Battery percentage, charge/discharge rate, time remaining, voltage, and a live 1-hour history chart |
+| **Per-app power** | Which processes drain the most battery, ranked by estimated watts with CPU and GPU breakdown |
+| **Components** | CPU, GPU, DRAM, modem, and NPU power via pie chart — with an "enhanced" badge when LibreHardwareMonitor provides extra sensors |
+| **Battery health** | Wear curve over time, cycle count, projected months until replacement |
+| **Charge habits** | 0 -- 100 score over a rolling 30-day window with actionable tips (overcharge frequency, deep discharge, time at 100%) |
+| **Sessions** | Every charge/discharge cycle logged with a rolling 7-day timeline view, drill-down per day, and summary stats |
+| **Sleep drain** | Battery loss during sleep sessions, flagging abnormal drain |
+| **Charge speed** | Current, peak, and average charge rate while plugged in |
+| **"If you unplug now"** | Predicted battery life based on current per-app usage |
+| **Notifications** | Charge limit alerts (80%), low battery warnings, periodic summaries, sleep drain alerts |
+| **Power plans** | Auto-switch Windows power plans at configurable battery thresholds |
+| **Export** | Full reports in JSON and PDF |
+| **System tray** | Battery percentage tooltip, quick actions, minimize to tray on close |
+| **Theme** | Light and dark, follows Windows system preference with accent color integration |
+| **Auto-updater** | Ed25519-signed updates pulled from GitHub Releases |
 
-## Supported Hardware
+## Supported hardware
 
-| Platform | CPU Power | GPU Power | Battery | Sleep Drain |
+| Platform | CPU power | GPU power | Battery | Sleep drain |
 |----------|-----------|-----------|---------|-------------|
-| Intel 12th gen+ | RAPL PP0/PP1 via EMI | NVML (discrete) or PP1 (integrated) | IOCTL | Modern Standby |
-| AMD Zen 3+ | RAPL via EMI | ADLX (future) or EMI | IOCTL | Modern Standby |
+| Intel 12th gen+ | RAPL via EMI or LHM | PP1 (integrated) / NVML (discrete) | IOCTL | Modern Standby |
+| AMD Zen 3+ | RAPL via EMI or LHM | EMI / ADLX (future) | IOCTL | Modern Standby |
 | Qualcomm Snapdragon X | EMI (CPU clusters, GPU, modem, NPU) | EMI | IOCTL | Modern Standby |
 
-Graceful degradation: if a sensor isn't available on your hardware, the feature is hidden rather than showing "N/A."
+If a sensor isn't available on your hardware, the card is hidden instead of showing dashes.
 
 ## Installation
 
 Download the latest installer from [GitHub Releases](https://github.com/Dudiebug/BugJuice/releases):
 
-- **BugJuice_x64-setup.exe** — Intel/AMD laptops
-- **BugJuice_arm64-setup.exe** — Snapdragon X laptops (Surface, Lenovo Yoga, etc.)
+- **BugJuice_1.0.0_x64-setup.exe** — Intel / AMD laptops
+- **BugJuice_1.0.0_arm64-setup.exe** — Snapdragon X laptops (Surface Pro, Lenovo Yoga, etc.)
 
-The installer registers a small Windows service (`bugjuice-svc`) that reads privileged power sensors. One UAC prompt at install, never again. The main app runs as a normal user.
+The installer registers a small Windows service (`bugjuice-svc`) that reads privileged power sensors. One UAC prompt at install time, then the main app runs as a normal user.
 
-**Optional (x64 only):** Install [LibreHardwareMonitor](https://github.com/LibreHardwareMonitor/LibreHardwareMonitor) for enhanced power monitoring — per-core CPU power, AMD GPU power, and additional sensors. BugJuice automatically detects LHM and surfaces extra data when available. ARM64 doesn't require LHM because Snapdragon X exposes all power metrics (CPU, GPU, modem, NPU) directly via the same EMI interface that x64 uses for RAPL.
+**x64 only (optional):** Install [LibreHardwareMonitor](https://github.com/LibreHardwareMonitor/LibreHardwareMonitor) for enhanced power monitoring. BugJuice auto-detects LHM and shows a green "enhanced" badge on the Components page when extra sensors are available. ARM64 doesn't need LHM — Snapdragon X exposes all power domains directly via EMI.
 
-## How It Works
+## How it works
 
-BugJuice is two binaries: a **Tauri v2 app** (Rust backend + React frontend) that reads unprivileged APIs (battery IOCTLs, GPU utilization, per-process CPU time, ProcessEnergyValues), and a **Windows service** that reads privileged EMI/RAPL data over a named pipe. All data is stored locally in SQLite.
+BugJuice is two binaries:
 
-## Building from Source
+1. **Tauri v2 app** (Rust + React) — reads unprivileged APIs: battery IOCTLs, per-process CPU time, ProcessEnergyValues, GPU utilization, and optionally LHM via WMI.
+2. **Windows service** (`bugjuice-svc`) — reads privileged EMI/RAPL data and serves it over a named pipe (`\\.\pipe\bugjuice`).
 
-**Prerequisites:**
-- [Rust](https://rustup.rs/) (stable, 1.77.2+)
-- [Node.js](https://nodejs.org/) (20+)
-- [Visual Studio Build Tools](https://visualstudio.microsoft.com/downloads/) with "Desktop development with C++"
-- Windows 10/11
+All data stays local in a SQLite database at `%LOCALAPPDATA%\BugJuice\bugjuice.db` with configurable retention (7 -- 90 days, default 30).
+
+## Building from source
+
+**Prerequisites:** [Rust](https://rustup.rs/) 1.77+, [Node.js](https://nodejs.org/) 20+, [Visual Studio Build Tools](https://visualstudio.microsoft.com/downloads/) with "Desktop development with C++", Windows 10/11.
 
 ```bash
 git clone https://github.com/Dudiebug/BugJuice.git
@@ -63,16 +66,21 @@ cd BugJuice
 npm install
 
 # Build the service
-cd service
-cargo build --release
+cd service && cargo build --release
 cp target/release/bugjuice-svc.exe ../src-tauri/
+cd ..
+
+# (x64 only) Build the LHM helper
+cd lhm-helper && dotnet publish -c Release -r win-x64
+cp bin/Release/net8.0-windows/win-x64/publish/bugjuice-lhm.exe ../src-tauri/
 cd ..
 
 # Dev mode
 npx tauri dev
 
-# Production build (creates NSIS installer)
-npx tauri build
+# Production build (NSIS installer)
+npx tauri build                                  # native arch
+npx tauri build --target x86_64-pc-windows-msvc  # cross-compile x64
 ```
 
 ## License
@@ -83,5 +91,5 @@ MIT
 
 - [Tauri](https://tauri.app/) — app framework
 - [Recharts](https://recharts.org/) — charts
-- [printpdf](https://github.com/nickkha/printpdf) — PDF generation
-- Logo: shield beetle with lightning bolt, designed for BugJuice
+- [printpdf](https://github.com/nickkha/printpdf) — PDF export
+- [LibreHardwareMonitorLib](https://github.com/LibreHardwareMonitor/LibreHardwareMonitor) — enhanced power sensors (x64)
