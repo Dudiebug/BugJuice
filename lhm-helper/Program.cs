@@ -8,6 +8,22 @@
 using System.Text.Json;
 using LibreHardwareMonitor.Hardware;
 
+// Log file for diagnostics — stderr is invisible when running as a service child.
+var logDir = Path.Combine(
+    Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData),
+    "BugJuice");
+Directory.CreateDirectory(logDir);
+var logPath = Path.Combine(logDir, "lhm-helper.log");
+
+void Log(string msg)
+{
+    var line = $"[{DateTime.Now:yyyy-MM-dd HH:mm:ss}] {msg}";
+    Console.Error.WriteLine(line);
+    try { File.AppendAllText(logPath, line + Environment.NewLine); } catch { }
+}
+
+Log($"bugjuice-lhm starting (pid={Environment.ProcessId})");
+
 var computer = new Computer
 {
     IsCpuEnabled = true,
@@ -18,14 +34,37 @@ var computer = new Computer
 try
 {
     computer.Open();
+    Log("computer.Open() succeeded");
 }
 catch (Exception ex)
 {
-    Console.Error.WriteLine($"[bugjuice-lhm] Failed to open hardware: {ex.Message}");
+    Log($"Failed to open hardware: {ex}");
     Environment.Exit(1);
 }
 
-Console.Error.WriteLine("[bugjuice-lhm] Started — reading power sensors");
+// Enumerate what LHM found so we can diagnose "no sensors" issues.
+foreach (var hw in computer.Hardware)
+{
+    Log($"  Hardware: {hw.HardwareType} — {hw.Name}");
+    hw.Update();
+    foreach (var sensor in hw.Sensors)
+    {
+        if (sensor.SensorType == SensorType.Power)
+            Log($"    Power sensor: \"{sensor.Name}\" = {sensor.Value} W");
+    }
+    foreach (var sub in hw.SubHardware)
+    {
+        Log($"  SubHardware: {sub.HardwareType} — {sub.Name}");
+        sub.Update();
+        foreach (var sensor in sub.Sensors)
+        {
+            if (sensor.SensorType == SensorType.Power)
+                Log($"    Power sensor: \"{sensor.Name}\" = {sensor.Value} W");
+        }
+    }
+}
+
+Log("Starting sensor polling loop");
 
 var visitor = new UpdateVisitor();
 var jsonOptions = new JsonSerializerOptions { PropertyNamingPolicy = JsonNamingPolicy.CamelCase };

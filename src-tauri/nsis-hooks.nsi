@@ -7,17 +7,31 @@
   ; Stop and remove any existing BugJuice service BEFORE extracting files.
   ; The service spawns bugjuice-lhm.exe as a child process — if the service
   ; is still running, the installer can't overwrite the locked LHM binary.
-  nsExec::ExecToLog 'sc stop BugJuice'
-  Pop $0
-  ; Give the service + child processes time to exit.
-  Sleep 3000
-  nsExec::ExecToLog 'sc delete BugJuice'
-  Pop $0
-  ; Kill any orphaned LHM helper that didn't exit with the service.
+  DetailPrint "Stopping existing BugJuice service..."
+
+  ; Force-kill the LHM helper first — it's a child of the service and holds
+  ; a file lock on bugjuice-lhm.exe. taskkill /F sends TerminateProcess.
   nsExec::ExecToLog 'taskkill /F /IM bugjuice-lhm.exe'
   Pop $0
+
+  ; Stop the service gracefully via SCM.
+  nsExec::ExecToLog 'sc stop BugJuice'
+  Pop $0
+
+  ; Wait for the service process to fully exit.
+  Sleep 2000
+
+  ; Force-kill the service process if it's still hanging.
   nsExec::ExecToLog 'taskkill /F /IM bugjuice-svc.exe'
   Pop $0
+
+  ; Brief pause so the OS releases file handles.
+  Sleep 1000
+
+  ; Remove the service registration from SCM.
+  nsExec::ExecToLog 'sc delete BugJuice'
+  Pop $0
+
   DetailPrint "Pre-install cleanup complete"
 !macroend
 
