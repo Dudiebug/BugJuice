@@ -29,3 +29,7 @@ Thumbs.db
 .DS_Store
 src-tauri/bugjuice-svc.exe
 src-tauri/bugjuice-lhm.exe
+
+# .NET build artifacts
+lhm-helper/bin/
+lhm-helper/obj/
