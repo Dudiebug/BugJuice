@@ -183,11 +183,15 @@ export function Dashboard() {
 
       {/* ─── Power breakdown ──────────────────────────────────────────── */}
       <section className="grid grid-4">
-        <PowerCard title="Wall input" watts={power.wallInputW} sub="from charger" />
+        <PowerCard
+          title="Charge rate"
+          watts={rateKnown ? rateAbs : null}
+          sub={charging ? 'into battery' : status.onAc ? 'on AC' : 'from battery'}
+        />
         <PowerCard
           title="System draw"
           watts={power.systemDrawW}
-          sub="whole laptop"
+          sub={power.systemDrawW ? 'SoC platform (excl. display)' : 'on battery only'}
         />
         <PowerCard
           title="CPU package"
