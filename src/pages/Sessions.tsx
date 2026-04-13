@@ -105,6 +105,61 @@ export function Sessions() {
     [gaps],
   );
 
+  // ── Component power gap detection ────────────────────────────────
+  // The component power series is independent of the battery history
+  // series — the two are sampled separately, so we compute gaps over
+  // `componentHistory` directly instead of reusing `gaps`. Anything
+  // with no data for longer than GAP_THRESHOLD (including leading or
+  // trailing empty regions inside the visible window) becomes a
+  // hatched overlay below.
+  const componentNoDataRegions = useMemo(() => {
+    const ch = data?.componentHistory ?? [];
+    const regions: Array<{ startTs: number; endTs: number }> = [];
+    if (ch.length === 0) {
+      regions.push({ startTs: windowStartTs, endTs: windowEndTs });
+      return regions;
+    }
+    if (ch[0].ts > windowStartTs + GAP_THRESHOLD) {
+      regions.push({ startTs: windowStartTs, endTs: ch[0].ts });
+    }
+    for (let i = 0; i < ch.length - 1; i++) {
+      if (ch[i + 1].ts - ch[i].ts > GAP_THRESHOLD) {
+        regions.push({ startTs: ch[i].ts, endTs: ch[i + 1].ts });
+      }
+    }
+    const last = ch[ch.length - 1].ts;
+    if (windowEndTs > last + GAP_THRESHOLD) {
+      regions.push({ startTs: last, endTs: windowEndTs });
+    }
+    return regions;
+  }, [data?.componentHistory, windowStartTs, windowEndTs, GAP_THRESHOLD]);
+
+  // Pre-process componentHistory so the stacked Areas break cleanly
+  // at interior gaps instead of drawing a linear bridge across them.
+  // Recharts breaks a line/area at any `null` y value, so we insert
+  // an all-null row just past the current point whenever the next
+  // point is more than GAP_THRESHOLD seconds away.
+  const processedComponentHistory = useMemo(() => {
+    const ch = data?.componentHistory ?? [];
+    if (ch.length === 0) return [] as Array<Record<string, number | null>>;
+    const rows: Array<Record<string, number | null>> = [];
+    for (let i = 0; i < ch.length; i++) {
+      rows.push(ch[i] as unknown as Record<string, number | null>);
+      if (i < ch.length - 1 && ch[i + 1].ts - ch[i].ts > GAP_THRESHOLD) {
+        rows.push({
+          ts: ch[i].ts + 1,
+          cpu: null,
+          gpu: null,
+          dram: null,
+          modem: null,
+          npu: null,
+          other: null,
+        });
+      }
+    }
+    return rows;
+  }, [data?.componentHistory, GAP_THRESHOLD]);
+
   // Summary stats — derives avg/peak drain from the history series so
   // live (in-progress) sessions count and the numbers scope cleanly to
   // the visible window.
@@ -729,7 +784,7 @@ export function Sessions() {
             </div>
           ) : (
             <ResponsiveContainer width="100%" height="100%">
-              <AreaChart data={data!.componentHistory} margin={{ top: 10, right: 12, left: -8, bottom: 0 }}>
+              <AreaChart data={processedComponentHistory} margin={{ top: 10, right: 12, left: -8, bottom: 0 }}>
                 <defs>
                   {(['cpu', 'gpu', 'dram', 'other'] as const).map((key, i) => {
                     const colors = ['var(--chart-1)', 'var(--chart-4)', 'var(--chart-5)', 'var(--chart-2)'];
@@ -740,19 +795,64 @@ export function Sessions() {
                       </linearGradient>
                     );
                   })}
+                  {/* Diagonal hatching for no-data regions — identical to
+                      the battery timeline's pattern, duplicated here
+                      because SVG patterns are scoped per <svg>. */}
+                  <pattern
+                    id="sess-hatch-nodata"
+                    patternUnits="userSpaceOnUse"
+                    width="8"
+                    height="8"
+                    patternTransform="rotate(45)"
+                  >
+                    <rect width="8" height="8" fill="rgba(255, 255, 255, 0.03)" />
+                    <line
+                      x1="0" y1="0" x2="0" y2="8"
+                      stroke="var(--text-muted)"
+                      strokeWidth="1.5"
+                      strokeOpacity="0.25"
+                    />
+                  </pattern>
                 </defs>
                 <CartesianGrid strokeDasharray="3 3" stroke="var(--border)" vertical={false} />
-                <XAxis dataKey="ts" tickFormatter={formatAxisTime} stroke="var(--text-muted)" fontSize={11} tickLine={false} />
+                {/* No-data regions (grey hatching) — clamped to the
+                    visible window so they don't render outside the plot. */}
+                {componentNoDataRegions.map((g, i) => {
+                  const band = clampBand(g.startTs, g.endTs, windowStartTs, windowEndTs);
+                  if (!band) return null;
+                  return (
+                    <ReferenceArea
+                      key={`comp-nodata-${i}`}
+                      x1={band[0]}
+                      x2={band[1]}
+                      fill="url(#sess-hatch-nodata)"
+                      stroke="none"
+                      ifOverflow="visible"
+                    />
+                  );
+                })}
+                <XAxis
+                  dataKey="ts"
+                  type="number"
+                  domain={[windowStartTs, windowEndTs]}
+                  scale="linear"
+                  ticks={xTicks}
+                  tickFormatter={formatAxisTime}
+                  stroke="var(--text-muted)"
+                  fontSize={11}
+                  tickLine={false}
+                  allowDataOverflow
+                />
                 <YAxis unit=" W" stroke="var(--text-muted)" fontSize={11} tickLine={false} width={48} />
                 <Tooltip
                   contentStyle={tooltipStyle}
                   labelFormatter={(ts: number) => new Date(ts * 1000).toLocaleString()}
                   formatter={(v: number, name: string) => [`${v.toFixed(2)} W`, name.toUpperCase()]}
                 />
-                <Area type="monotone" dataKey="cpu" stackId="1" stroke="var(--chart-1)" strokeWidth={1.5} fill="url(#sess-fill-cpu)" isAnimationActive={false} name="CPU" />
-                <Area type="monotone" dataKey="gpu" stackId="1" stroke="var(--chart-4)" strokeWidth={1.5} fill="url(#sess-fill-gpu)" isAnimationActive={false} name="GPU" />
-                <Area type="monotone" dataKey="dram" stackId="1" stroke="var(--chart-5)" strokeWidth={1.5} fill="url(#sess-fill-dram)" isAnimationActive={false} name="DRAM" />
-                <Area type="monotone" dataKey="other" stackId="1" stroke="var(--chart-2)" strokeWidth={1.5} fill="url(#sess-fill-other)" isAnimationActive={false} name="Other" />
+                <Area type="monotone" dataKey="cpu" stackId="1" stroke="var(--chart-1)" strokeWidth={1.5} fill="url(#sess-fill-cpu)" isAnimationActive={false} connectNulls={false} name="CPU" />
+                <Area type="monotone" dataKey="gpu" stackId="1" stroke="var(--chart-4)" strokeWidth={1.5} fill="url(#sess-fill-gpu)" isAnimationActive={false} connectNulls={false} name="GPU" />
+                <Area type="monotone" dataKey="dram" stackId="1" stroke="var(--chart-5)" strokeWidth={1.5} fill="url(#sess-fill-dram)" isAnimationActive={false} connectNulls={false} name="DRAM" />
+                <Area type="monotone" dataKey="other" stackId="1" stroke="var(--chart-2)" strokeWidth={1.5} fill="url(#sess-fill-other)" isAnimationActive={false} connectNulls={false} name="Other" />
               </AreaChart>
             </ResponsiveContainer>
           )}
