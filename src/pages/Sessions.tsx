@@ -193,49 +193,91 @@ export function Sessions() {
   // window so we can show a tooltip anywhere, including inside sleep /
   // interpolated / charging bands where Recharts' built-in Tooltip snaps
   // to the nearest data point and misses the gap regions entirely.
+  //
+  // All hover-dependent UI (tooltip, guideline, day highlight) is
+  // rendered OUTSIDE the Recharts chart as absolutely-positioned divs
+  // so mouse movement doesn't force the chart SVG to re-render, and
+  // we coalesce mousemove events to one rAF tick to keep things smooth.
   const chartContainerRef = useRef<HTMLDivElement>(null);
-  const [hoverTs, setHoverTs] = useState<number | null>(null);
-  const [hoverClientX, setHoverClientX] = useState<number | null>(null);
+  const [hoverState, setHoverState] = useState<HoverState | null>(null);
+  const rafRef = useRef<number | null>(null);
+  const pendingClientXRef = useRef<number | null>(null);
 
   const handleChartMouseMove = (e: ReactMouseEvent<HTMLDivElement>) => {
-    const container = chartContainerRef.current;
-    if (!container || history.length === 0) return;
-    const rect = container.getBoundingClientRect();
-    const relX = e.clientX - rect.left;
-    // Plot area width = container width minus the Y-axis gutter on the
-    // left and the right margin. Recharts' default YAxis width is 40px
-    // (configured above), and we pass `left: -8` in the chart margin so
-    // the actual plot left edge is at ~32px, right edge at container
-    // width minus 12. Keep these in sync with CHART_MARGIN below.
-    const plotLeft = 40 + CHART_MARGIN.left;
-    const plotRight = rect.width - CHART_MARGIN.right;
-    if (relX < plotLeft || relX > plotRight) {
-      setHoverTs(null);
-      setHoverClientX(null);
-      return;
-    }
-    const frac = (relX - plotLeft) / Math.max(1, plotRight - plotLeft);
-    const ts = Math.round(windowStartTs + frac * (windowEndTs - windowStartTs));
-    setHoverTs(ts);
-    setHoverClientX(relX);
+    pendingClientXRef.current = e.clientX;
+    if (rafRef.current != null) return;
+    rafRef.current = requestAnimationFrame(() => {
+      rafRef.current = null;
+      const clientX = pendingClientXRef.current;
+      pendingClientXRef.current = null;
+      if (clientX == null) return;
+      const container = chartContainerRef.current;
+      if (!container || history.length === 0) return;
+      const rect = container.getBoundingClientRect();
+      const relX = clientX - rect.left;
+      // Plot area width = container width minus the Y-axis gutter on the
+      // left and the right margin. Recharts' default YAxis width is 40px
+      // (configured below), and we pass `left: -8` in CHART_MARGIN so
+      // the actual plot left edge is ~32px, right edge at rect.width-12.
+      const plotLeft = 40 + CHART_MARGIN.left;
+      const plotRight = rect.width - CHART_MARGIN.right;
+      if (relX < plotLeft || relX > plotRight) {
+        setHoverState(null);
+        return;
+      }
+      const frac = (relX - plotLeft) / Math.max(1, plotRight - plotLeft);
+      const ts = Math.round(windowStartTs + frac * (windowEndTs - windowStartTs));
+      setHoverState({ ts, clientX: relX, plotLeft, plotRight });
+    });
   };
 
   const handleChartMouseLeave = () => {
-    setHoverTs(null);
-    setHoverClientX(null);
+    if (rafRef.current != null) {
+      cancelAnimationFrame(rafRef.current);
+      rafRef.current = null;
+    }
+    pendingClientXRef.current = null;
+    setHoverState(null);
   };
 
+  useEffect(
+    () => () => {
+      if (rafRef.current != null) cancelAnimationFrame(rafRef.current);
+    },
+    [],
+  );
+
   const hoverInfo = useMemo(() => {
-    if (hoverTs == null) return null;
+    if (hoverState == null) return null;
     return computeHoverInfo(
-      hoverTs,
+      hoverState.ts,
       history,
       chargingSessions,
       sleepSessions,
       gaps,
       windowEndTs,
     );
-  }, [hoverTs, history, chargingSessions, sleepSessions, gaps, windowEndTs]);
+  }, [hoverState, history, chargingSessions, sleepSessions, gaps, windowEndTs]);
+
+  // Pixel-space bounds of the day currently under the cursor (week view
+  // only). Used to render a soft glow highlight over that day so it
+  // reads as clickable.
+  const dayHighlight = useMemo(() => {
+    if (hoverState == null || viewMode !== 'week') return null;
+    const d = new Date(hoverState.ts * 1000);
+    d.setHours(0, 0, 0, 0);
+    const dayStartTs = Math.floor(d.getTime() / 1000);
+    const dayEndTs = dayStartTs + 86400;
+    const s = Math.max(dayStartTs, windowStartTs);
+    const e = Math.min(dayEndTs, windowEndTs);
+    if (e <= s) return null;
+    const windowSpan = windowEndTs - windowStartTs;
+    if (windowSpan <= 0) return null;
+    const plotWidth = hoverState.plotRight - hoverState.plotLeft;
+    const leftPx = hoverState.plotLeft + ((s - windowStartTs) / windowSpan) * plotWidth;
+    const rightPx = hoverState.plotLeft + ((e - windowStartTs) / windowSpan) * plotWidth;
+    return { left: leftPx, width: Math.max(0, rightPx - leftPx) };
+  }, [hoverState, viewMode, windowStartTs, windowEndTs]);
 
   return (
     <div className="page">
@@ -423,14 +465,16 @@ export function Sessions() {
                   vertical={false}
                 />
 
-                {/* Day boundary dividers (week view only) */}
+                {/* Day boundary dividers (week view only). Solid so they
+                    read as real dividers rather than blending with the
+                    horizontal CartesianGrid. */}
                 {dayBoundaries.map((ts) => (
                   <ReferenceLine
                     key={`daybound-${ts}`}
                     x={ts}
-                    stroke="var(--border)"
-                    strokeDasharray="2 4"
-                    strokeOpacity={0.6}
+                    stroke="var(--text-muted)"
+                    strokeWidth={1.25}
+                    strokeOpacity={0.55}
                     ifOverflow="visible"
                   />
                 ))}
@@ -497,16 +541,10 @@ export function Sessions() {
                   );
                 })}
 
-                {/* Cursor guideline driven by hoverTs state */}
-                {hoverTs != null && (
-                  <ReferenceLine
-                    x={hoverTs}
-                    stroke="var(--text-muted)"
-                    strokeDasharray="3 3"
-                    strokeOpacity={0.8}
-                    ifOverflow="visible"
-                  />
-                )}
+                {/* Cursor guideline is rendered as an absolute div outside
+                    the chart SVG below — keeping it out of the Recharts
+                    tree prevents the chart from re-rendering on every
+                    mousemove. */}
 
                 {/* Explicit domain = window bounds. With ['dataMin','dataMax']
                     Recharts would discard ReferenceAreas whose x1/x2 fall
@@ -546,37 +584,76 @@ export function Sessions() {
               </ComposedChart>
             </ResponsiveContainer>
           )}
+          {/* Day hover glow (week view) — signals the day is clickable.
+              Rendered outside the chart SVG so mousemove doesn't
+              re-render the Recharts tree. */}
+          {dayHighlight && (
+            <div
+              aria-hidden
+              style={{
+                position: 'absolute',
+                left: dayHighlight.left,
+                width: dayHighlight.width,
+                top: CHART_MARGIN.top,
+                bottom: 30,
+                pointerEvents: 'none',
+                background:
+                  'radial-gradient(ellipse at center, rgba(255,255,255,0.10) 0%, rgba(255,255,255,0.03) 65%, transparent 100%)',
+                boxShadow: 'inset 0 0 28px rgba(255,255,255,0.08)',
+                borderRadius: 4,
+                transition: 'left 80ms linear, width 80ms linear',
+                zIndex: 1,
+              }}
+            />
+          )}
+          {/* Cursor guideline (absolute div instead of Recharts
+              ReferenceLine so the chart SVG stays stable on mousemove). */}
+          {hoverState && (
+            <div
+              aria-hidden
+              style={{
+                position: 'absolute',
+                left: hoverState.clientX,
+                top: CHART_MARGIN.top,
+                bottom: 30,
+                width: 0,
+                pointerEvents: 'none',
+                borderLeft: '1px dashed var(--text-muted)',
+                opacity: 0.8,
+                zIndex: 2,
+              }}
+            />
+          )}
           {/* Custom cursor tooltip overlay — works across interpolated,
               sleep, and charging bands (Recharts' built-in Tooltip snaps to
               data points and fails inside gap regions). */}
-          {hoverTs != null && hoverInfo && (
+          {hoverState && hoverInfo && (
             <div
               style={{
                 position: 'absolute',
-                left: hoverClientX ?? 0,
+                left: hoverState.clientX,
                 top: 8,
                 transform: `translateX(${
-                  hoverClientX != null && chartContainerRef.current
-                    ? hoverClientX > chartContainerRef.current.clientWidth - 180
-                      ? '-100%'
-                      : '8px'
+                  chartContainerRef.current &&
+                  hoverState.clientX > chartContainerRef.current.clientWidth - 180
+                    ? 'calc(-100% - 8px)'
                     : '8px'
                 })`,
                 pointerEvents: 'none',
-                background: 'var(--bg-raised)',
-                border: '1px solid var(--border)',
+                background: 'var(--bg-card)',
+                border: '1px solid var(--border-strong)',
                 borderRadius: 6,
                 padding: '8px 10px',
                 fontSize: 12,
                 lineHeight: 1.5,
                 color: 'var(--text)',
-                boxShadow: '0 4px 14px rgba(0,0,0,0.25)',
+                boxShadow: '0 8px 24px rgba(0, 0, 0, 0.45)',
                 minWidth: 160,
                 zIndex: 5,
               }}
             >
               <div style={{ color: 'var(--text-muted)', fontSize: 11 }}>
-                {formatFullTimestamp(hoverTs)}
+                {formatFullTimestamp(hoverState.ts)}
               </div>
               <div style={{ marginTop: 4, display: 'flex', gap: 6, alignItems: 'center' }}>
                 <RegionDot region={hoverInfo.region} />
@@ -1137,6 +1214,15 @@ interface HoverInfo {
   percent: number | null;
   rateLabel: string | null;
   rateEstimated: boolean;
+}
+
+// Single consolidated hover snapshot — one setState call per rAF tick
+// covers both the tooltip text and the day-highlight geometry.
+interface HoverState {
+  ts: number;
+  clientX: number;
+  plotLeft: number;
+  plotRight: number;
 }
 
 // Recharts chart margins. Kept as a module-scoped constant so the cursor
