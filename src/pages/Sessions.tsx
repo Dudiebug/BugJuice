@@ -1,18 +1,18 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState, type MouseEvent as ReactMouseEvent } from 'react';
 import {
   Area,
   AreaChart,
   CartesianGrid,
   ComposedChart,
   ReferenceArea,
+  ReferenceLine,
   ResponsiveContainer,
-
   Tooltip,
   XAxis,
   YAxis,
 } from 'recharts';
 import { getUnifiedTimeline, type UnifiedTimeline } from '@/api';
-import type { BatterySession, SleepSession } from '@/types';
+import type { BatterySession, HistoryPoint, SleepSession } from '@/types';
 
 // ─── View modes ──────────────────────────────────────────────────────
 
@@ -34,12 +34,19 @@ export function Sessions() {
   const [data, setData] = useState<UnifiedTimeline | null>(null);
   const [loading, setLoading] = useState(true);
 
-  // Fetch data whenever view parameters change
+  // Window bounds for the current view. Lifted out of the fetch effect so
+  // the chart, stats, and cursor overlay can all share the same numeric
+  // range without re-deriving it.
+  const { startTs: windowStartTs, endTs: windowEndTs } = useMemo(
+    () => getTimeRange(viewMode, weekStart, selectedDay, customStart, customEnd),
+    [viewMode, weekStart, selectedDay, customStart, customEnd],
+  );
+
+  // Fetch data whenever the window changes
   useEffect(() => {
     let cancelled = false;
     setLoading(true);
-    const { startTs, endTs } = getTimeRange(viewMode, weekStart, selectedDay, customStart, customEnd);
-    getUnifiedTimeline(startTs, endTs).then((d) => {
+    getUnifiedTimeline(windowStartTs, windowEndTs).then((d) => {
       if (!cancelled) {
         setData(d);
         setLoading(false);
@@ -48,7 +55,7 @@ export function Sessions() {
     return () => {
       cancelled = true;
     };
-  }, [viewMode, weekStart, selectedDay, customStart, customEnd]);
+  }, [windowStartTs, windowEndTs]);
 
   // Derived data
   const { history, batterySessions, sleepSessions } = data ?? {
@@ -98,10 +105,12 @@ export function Sessions() {
     [gaps],
   );
 
-  // Summary stats
+  // Summary stats — derives avg/peak drain from the history series so
+  // live (in-progress) sessions count and the numbers scope cleanly to
+  // the visible window.
   const stats = useMemo(
-    () => computeStats(batterySessions, sleepSessions),
-    [batterySessions, sleepSessions],
+    () => computeStats(history, batterySessions, sleepSessions, windowStartTs, windowEndTs),
+    [history, batterySessions, sleepSessions, windowStartTs, windowEndTs],
   );
 
   // Prevent navigating forward past the current rolling window
@@ -125,12 +134,12 @@ export function Sessions() {
   }, [batterySessions, sleepSessions]);
 
   // X-axis tick positions — we generate clean hour / day boundaries
-  // so the numeric axis has well-placed labels.
+  // so the numeric axis has well-placed labels. Driven by the window
+  // bounds (not history) so ticks are stable even when history is
+  // sparse or the view window extends beyond the first/last data point.
   const xTicks = useMemo(() => {
-    if (history.length === 0) return [];
-    const min = history[0].ts;
-    const max = history[history.length - 1].ts;
-    const range = max - min;
+    const range = windowEndTs - windowStartTs;
+    if (range <= 0) return [];
     let interval: number;
     if (range <= 86400) {
       interval = 3600; // every hour for <= 1 day
@@ -140,13 +149,25 @@ export function Sessions() {
       interval = 86400; // every day for longer ranges
     }
     const ticks: number[] = [];
-    let tick = Math.ceil(min / interval) * interval;
-    while (tick <= max) {
+    let tick = Math.ceil(windowStartTs / interval) * interval;
+    while (tick <= windowEndTs) {
       ticks.push(tick);
       tick += interval;
     }
     return ticks;
-  }, [history]);
+  }, [windowStartTs, windowEndTs]);
+
+  // Day boundaries for the week view divider lines.
+  const dayBoundaries = useMemo(() => {
+    if (viewMode !== 'week') return [] as number[];
+    const boundaries: number[] = [];
+    for (let i = 1; i <= 6; i++) {
+      const d = addDays(weekStart, i);
+      d.setHours(0, 0, 0, 0);
+      boundaries.push(Math.floor(d.getTime() / 1000));
+    }
+    return boundaries;
+  }, [viewMode, weekStart]);
 
   // X-axis time formatter based on view mode
   const formatAxisTime = (ts: number) => {
@@ -167,6 +188,54 @@ export function Sessions() {
       setViewMode('day');
     }
   };
+
+  // ── Cursor overlay: map pointer position to a timestamp inside the
+  // window so we can show a tooltip anywhere, including inside sleep /
+  // interpolated / charging bands where Recharts' built-in Tooltip snaps
+  // to the nearest data point and misses the gap regions entirely.
+  const chartContainerRef = useRef<HTMLDivElement>(null);
+  const [hoverTs, setHoverTs] = useState<number | null>(null);
+  const [hoverClientX, setHoverClientX] = useState<number | null>(null);
+
+  const handleChartMouseMove = (e: ReactMouseEvent<HTMLDivElement>) => {
+    const container = chartContainerRef.current;
+    if (!container || history.length === 0) return;
+    const rect = container.getBoundingClientRect();
+    const relX = e.clientX - rect.left;
+    // Plot area width = container width minus the Y-axis gutter on the
+    // left and the right margin. Recharts' default YAxis width is 40px
+    // (configured above), and we pass `left: -8` in the chart margin so
+    // the actual plot left edge is at ~32px, right edge at container
+    // width minus 12. Keep these in sync with CHART_MARGIN below.
+    const plotLeft = 40 + CHART_MARGIN.left;
+    const plotRight = rect.width - CHART_MARGIN.right;
+    if (relX < plotLeft || relX > plotRight) {
+      setHoverTs(null);
+      setHoverClientX(null);
+      return;
+    }
+    const frac = (relX - plotLeft) / Math.max(1, plotRight - plotLeft);
+    const ts = Math.round(windowStartTs + frac * (windowEndTs - windowStartTs));
+    setHoverTs(ts);
+    setHoverClientX(relX);
+  };
+
+  const handleChartMouseLeave = () => {
+    setHoverTs(null);
+    setHoverClientX(null);
+  };
+
+  const hoverInfo = useMemo(() => {
+    if (hoverTs == null) return null;
+    return computeHoverInfo(
+      hoverTs,
+      history,
+      chargingSessions,
+      sleepSessions,
+      gaps,
+      windowEndTs,
+    );
+  }, [hoverTs, history, chargingSessions, sleepSessions, gaps, windowEndTs]);
 
   return (
     <div className="page">
@@ -259,14 +328,14 @@ export function Sessions() {
         />
         <SummaryCard
           label="Average drain"
-          value={stats.avgDrainW !== 0 ? `${Math.abs(stats.avgDrainW).toFixed(1)} W` : '--'}
+          value={stats.avgDrainW > 0 ? `${stats.avgDrainW.toFixed(1)} W` : '--'}
           context="mean discharge rate"
         />
         <SummaryCard
           label="Fastest discharge"
-          value={stats.peakDrainW !== 0 ? `${Math.abs(stats.peakDrainW).toFixed(1)} W` : '--'}
+          value={stats.peakDrainW > 0 ? `${stats.peakDrainW.toFixed(1)} W` : '--'}
           context="peak session drain"
-          danger={stats.peakDrainW < -15}
+          danger={stats.peakDrainW > 15}
         />
         <SummaryCard
           label="Sleep drain"
@@ -298,7 +367,12 @@ export function Sessions() {
             </span>
           )}
         </div>
-        <div style={{ height: 320 }}>
+        <div
+          ref={chartContainerRef}
+          onMouseMove={handleChartMouseMove}
+          onMouseLeave={handleChartMouseLeave}
+          style={{ height: 320, position: 'relative' }}
+        >
           {history.length === 0 ? (
             <div
               style={{
@@ -316,7 +390,7 @@ export function Sessions() {
             <ResponsiveContainer width="100%" height="100%">
               <ComposedChart
                 data={history}
-                margin={{ top: 10, right: 12, left: -8, bottom: 0 }}
+                margin={CHART_MARGIN}
                 onClick={handleChartClick}
                 style={viewMode === 'week' ? { cursor: 'pointer' } : undefined}
               >
@@ -349,58 +423,106 @@ export function Sessions() {
                   vertical={false}
                 />
 
+                {/* Day boundary dividers (week view only) */}
+                {dayBoundaries.map((ts) => (
+                  <ReferenceLine
+                    key={`daybound-${ts}`}
+                    x={ts}
+                    stroke="var(--border)"
+                    strokeDasharray="2 4"
+                    strokeOpacity={0.6}
+                    ifOverflow="visible"
+                  />
+                ))}
+
                 {/* Interpolated gap bands (diagonal hatching) — no-data
                     regions that aren't sleep. Rendered first so they sit
-                    behind charging / sleep bands. */}
-                {interpolatedGaps.map((g, i) => (
-                  <ReferenceArea
-                    key={`interp-${i}`}
-                    x1={g.startTs}
-                    x2={g.endTs}
-                    fill="url(#hatchInterpolated)"
-                    fillOpacity={1}
-                    isFront
-                  />
-                ))}
+                    behind charging / sleep bands. Bands are clamped to the
+                    window bounds so sessions crossing the window edge still
+                    render their in-window portion. */}
+                {interpolatedGaps.map((g, i) => {
+                  const band = clampBand(g.startTs, g.endTs, windowStartTs, windowEndTs);
+                  if (!band) return null;
+                  return (
+                    <ReferenceArea
+                      key={`interp-${i}`}
+                      x1={band[0]}
+                      x2={band[1]}
+                      fill="url(#hatchInterpolated)"
+                      fillOpacity={1}
+                      isFront
+                    />
+                  );
+                })}
 
                 {/* Charging session bands (green) */}
-                {chargingSessions.map((s, i) => (
-                  <ReferenceArea
-                    key={`charge-${i}`}
-                    x1={s.startedAt}
-                    x2={s.endedAt ?? history[history.length - 1]?.ts ?? s.startedAt}
-                    fill="rgba(34, 197, 94, 0.2)"
-                    fillOpacity={1}
-                    isFront
-                  />
-                ))}
+                {chargingSessions.map((s, i) => {
+                  const band = clampBand(
+                    s.startedAt,
+                    s.endedAt ?? windowEndTs,
+                    windowStartTs,
+                    windowEndTs,
+                  );
+                  if (!band) return null;
+                  return (
+                    <ReferenceArea
+                      key={`charge-${i}`}
+                      x1={band[0]}
+                      x2={band[1]}
+                      fill="rgba(34, 197, 94, 0.2)"
+                      fillOpacity={1}
+                      isFront
+                    />
+                  );
+                })}
 
                 {/* Sleep session bands (purple) */}
-                {sleepSessions.map((s, i) => (
-                  <ReferenceArea
-                    key={`sleep-${i}`}
-                    x1={s.sleepAt}
-                    x2={s.wakeAt ?? history[history.length - 1]?.ts ?? s.sleepAt}
-                    fill="rgba(139, 92, 246, 0.25)"
-                    fillOpacity={1}
-                    isFront
-                  />
-                ))}
+                {sleepSessions.map((s, i) => {
+                  const band = clampBand(
+                    s.sleepAt,
+                    s.wakeAt ?? windowEndTs,
+                    windowStartTs,
+                    windowEndTs,
+                  );
+                  if (!band) return null;
+                  return (
+                    <ReferenceArea
+                      key={`sleep-${i}`}
+                      x1={band[0]}
+                      x2={band[1]}
+                      fill="rgba(139, 92, 246, 0.25)"
+                      fillOpacity={1}
+                      isFront
+                    />
+                  );
+                })}
 
-                {/* CRITICAL: type="number" makes this a continuous numeric
-                    axis instead of categorical. Without it, ReferenceArea
-                    x1/x2 must exactly match a data point ts — which session
-                    timestamps never do, so bands silently vanish. */}
+                {/* Cursor guideline driven by hoverTs state */}
+                {hoverTs != null && (
+                  <ReferenceLine
+                    x={hoverTs}
+                    stroke="var(--text-muted)"
+                    strokeDasharray="3 3"
+                    strokeOpacity={0.8}
+                    ifOverflow="visible"
+                  />
+                )}
+
+                {/* Explicit domain = window bounds. With ['dataMin','dataMax']
+                    Recharts would discard ReferenceAreas whose x1/x2 fall
+                    outside the actual history points, which broke the day
+                    view overlays for sessions crossing midnight. */}
                 <XAxis
                   dataKey="ts"
                   type="number"
-                  domain={['dataMin', 'dataMax']}
+                  domain={[windowStartTs, windowEndTs]}
                   scale="linear"
                   ticks={xTicks}
                   stroke="var(--text-muted)"
                   fontSize={11}
                   tickLine={false}
                   tickFormatter={formatAxisTime}
+                  allowDataOverflow
                 />
                 <YAxis
                   domain={[0, 100]}
@@ -409,14 +531,6 @@ export function Sessions() {
                   tickLine={false}
                   tickFormatter={(v) => `${v}%`}
                   width={40}
-                />
-                <Tooltip
-                  contentStyle={tooltipStyle}
-                  labelFormatter={(ts: number) => new Date(ts * 1000).toLocaleString()}
-                  formatter={(v: number, name: string) => {
-                    if (name === 'percent') return [`${v.toFixed(1)}%`, 'Battery'];
-                    return [`${v.toFixed(2)} W`, 'Rate'];
-                  }}
                 />
 
                 <Area
@@ -431,6 +545,57 @@ export function Sessions() {
 
               </ComposedChart>
             </ResponsiveContainer>
+          )}
+          {/* Custom cursor tooltip overlay — works across interpolated,
+              sleep, and charging bands (Recharts' built-in Tooltip snaps to
+              data points and fails inside gap regions). */}
+          {hoverTs != null && hoverInfo && (
+            <div
+              style={{
+                position: 'absolute',
+                left: hoverClientX ?? 0,
+                top: 8,
+                transform: `translateX(${
+                  hoverClientX != null && chartContainerRef.current
+                    ? hoverClientX > chartContainerRef.current.clientWidth - 180
+                      ? '-100%'
+                      : '8px'
+                    : '8px'
+                })`,
+                pointerEvents: 'none',
+                background: 'var(--bg-raised)',
+                border: '1px solid var(--border)',
+                borderRadius: 6,
+                padding: '8px 10px',
+                fontSize: 12,
+                lineHeight: 1.5,
+                color: 'var(--text)',
+                boxShadow: '0 4px 14px rgba(0,0,0,0.25)',
+                minWidth: 160,
+                zIndex: 5,
+              }}
+            >
+              <div style={{ color: 'var(--text-muted)', fontSize: 11 }}>
+                {formatFullTimestamp(hoverTs)}
+              </div>
+              <div style={{ marginTop: 4, display: 'flex', gap: 6, alignItems: 'center' }}>
+                <RegionDot region={hoverInfo.region} />
+                <span style={{ fontWeight: 500, textTransform: 'capitalize' }}>
+                  {hoverInfo.region}
+                </span>
+              </div>
+              {hoverInfo.percent != null && (
+                <div style={{ marginTop: 2 }}>
+                  Battery: <b>{hoverInfo.percent.toFixed(1)}%</b>
+                </div>
+              )}
+              {hoverInfo.rateLabel && (
+                <div>
+                  {hoverInfo.rateEstimated ? 'Est. rate' : 'Rate'}:{' '}
+                  <b>{hoverInfo.rateLabel}</b>
+                </div>
+              )}
+            </div>
           )}
         </div>
 
@@ -964,6 +1129,20 @@ interface SummaryStats {
   totalSleepDrainMwh: number;
 }
 
+// Region shown in the custom cursor tooltip.
+type HoverRegion = 'charging' | 'sleep' | 'interpolated' | 'discharge' | 'idle';
+
+interface HoverInfo {
+  region: HoverRegion;
+  percent: number | null;
+  rateLabel: string | null;
+  rateEstimated: boolean;
+}
+
+// Recharts chart margins. Kept as a module-scoped constant so the cursor
+// overlay math stays in sync with what Recharts sees.
+const CHART_MARGIN = { top: 10, right: 12, left: -8, bottom: 0 } as const;
+
 function getTimeRange(
   viewMode: ViewMode,
   weekStart: Date,
@@ -997,32 +1176,63 @@ function getTimeRange(
   };
 }
 
+// Compute summary stats for the current window.
+//
+// `avgDrainW` and `peakDrainW` are derived from the per-tick `history`
+// series rather than from `BatterySession.avgDrainW`. Sessions that are
+// still in progress have `avgDrainW === null` (the backend only writes
+// it on session close), so the rolling 7-day window frequently left
+// both cards reading "--" when the user's only discharge session was
+// the one currently in progress. Deriving from `history` also correctly
+// scopes the numbers to the visible window.
+//
+// `timeOnBatterySec` clamps each discharge session's duration to the
+// window bounds so sessions that cross the window boundary only count
+// their in-window portion.
 function computeStats(
+  history: HistoryPoint[],
   batterySessions: BatterySession[],
   sleepSessions: SleepSession[],
+  windowStartTs: number,
+  windowEndTs: number,
 ): SummaryStats {
   const now = Math.floor(Date.now() / 1000);
 
   let timeOnBatterySec = 0;
-  let drainSum = 0;
-  let drainCount = 0;
-  let peakDrainW = 0;
-
   for (const s of batterySessions) {
-    if (!s.onAc) {
-      const end = s.endedAt ?? now;
-      timeOnBatterySec += end - s.startedAt;
-      if (s.avgDrainW != null) {
-        drainSum += s.avgDrainW;
-        drainCount++;
-        if (s.avgDrainW < peakDrainW) {
-          peakDrainW = s.avgDrainW;
-        }
-      }
+    if (s.onAc) continue;
+    const start = Math.max(s.startedAt, windowStartTs);
+    const end = Math.min(s.endedAt ?? now, windowEndTs);
+    if (end > start) timeOnBatterySec += end - start;
+  }
+
+  // Time-weighted mean of history.rateW for discharging samples.
+  let weightedSum = 0;
+  let weightTotal = 0;
+  let minRate = 0;
+  for (let i = 0; i < history.length - 1; i++) {
+    const a = history[i];
+    const b = history[i + 1];
+    const dt = b.ts - a.ts;
+    if (dt <= 0 || dt > STATS_GAP_THRESHOLD) continue;
+    if (!Number.isFinite(a.rateW)) continue;
+    if (a.rateW < 0) {
+      weightedSum += a.rateW * dt;
+      weightTotal += dt;
+      if (a.rateW < minRate) minRate = a.rateW;
+    }
+  }
+  // Include the final point for peak detection (the loop above only
+  // inspects history[0..length-2]).
+  if (history.length > 0) {
+    const last = history[history.length - 1];
+    if (Number.isFinite(last.rateW) && last.rateW < minRate) {
+      minRate = last.rateW;
     }
   }
 
-  const avgDrainW = drainCount > 0 ? drainSum / drainCount : 0;
+  const avgDrainW = weightTotal > 0 ? Math.abs(weightedSum / weightTotal) : 0;
+  const peakDrainW = minRate < 0 ? Math.abs(minRate) : 0;
 
   let totalSleepDrainMwh = 0;
   for (const s of sleepSessions) {
@@ -1032,6 +1242,185 @@ function computeStats(
   }
 
   return { timeOnBatterySec, avgDrainW, peakDrainW, totalSleepDrainMwh };
+}
+
+// Gap threshold in seconds — matches the component's local constant
+// so a long polling gap doesn't poison the time-weighted average.
+const STATS_GAP_THRESHOLD = 300;
+
+// Clamp a band's [a, b] interval to [lo, hi]. Returns null if the
+// clamped interval has zero or negative length.
+function clampBand(
+  a: number,
+  b: number,
+  lo: number,
+  hi: number,
+): [number, number] | null {
+  const x1 = Math.max(a, lo);
+  const x2 = Math.min(b, hi);
+  return x2 > x1 ? [x1, x2] : null;
+}
+
+// Linearly interpolate battery percent and rate at a given ts between
+// adjacent history points. Returns null if ts is outside the history
+// range (caller falls back to region-based estimates).
+function interpolateHistoryAt(
+  history: HistoryPoint[],
+  ts: number,
+): { percent: number; rateW: number } | null {
+  if (history.length === 0) return null;
+  if (ts <= history[0].ts) {
+    return { percent: history[0].percent, rateW: history[0].rateW };
+  }
+  if (ts >= history[history.length - 1].ts) {
+    const last = history[history.length - 1];
+    return { percent: last.percent, rateW: last.rateW };
+  }
+  // Binary search for the right-side index.
+  let lo = 0;
+  let hi = history.length - 1;
+  while (lo + 1 < hi) {
+    const mid = (lo + hi) >> 1;
+    if (history[mid].ts <= ts) lo = mid;
+    else hi = mid;
+  }
+  const a = history[lo];
+  const b = history[hi];
+  const span = b.ts - a.ts;
+  if (span <= 0) return { percent: a.percent, rateW: a.rateW };
+  const frac = (ts - a.ts) / span;
+  return {
+    percent: a.percent + (b.percent - a.percent) * frac,
+    rateW: a.rateW + (b.rateW - a.rateW) * frac,
+  };
+}
+
+// Classify which "kind" of timeline region the cursor is hovering over.
+// Priority: sleep > interpolated > charging > (rateW-based) discharge/idle.
+function classifyRegion(
+  ts: number,
+  chargingSessions: BatterySession[],
+  sleepSessions: SleepSession[],
+  gaps: GapRegion[],
+  interpolated: { percent: number; rateW: number } | null,
+  windowEndTs: number,
+): HoverRegion {
+  for (const s of sleepSessions) {
+    const wake = s.wakeAt ?? windowEndTs;
+    if (s.sleepAt <= ts && ts <= wake) return 'sleep';
+  }
+  for (const g of gaps) {
+    if (g.type === 'interpolated' && g.startTs <= ts && ts <= g.endTs) {
+      return 'interpolated';
+    }
+  }
+  for (const s of chargingSessions) {
+    const end = s.endedAt ?? windowEndTs;
+    if (s.startedAt <= ts && ts <= end) return 'charging';
+  }
+  if (interpolated && interpolated.rateW < -0.1) return 'discharge';
+  return 'idle';
+}
+
+// Compute everything the cursor tooltip needs to render for a given ts.
+function computeHoverInfo(
+  ts: number,
+  history: HistoryPoint[],
+  chargingSessions: BatterySession[],
+  sleepSessions: SleepSession[],
+  gaps: GapRegion[],
+  windowEndTs: number,
+): HoverInfo {
+  const interp = interpolateHistoryAt(history, ts);
+  const region = classifyRegion(ts, chargingSessions, sleepSessions, gaps, interp, windowEndTs);
+
+  let percent: number | null = interp ? interp.percent : null;
+  let rateLabel: string | null = null;
+  let rateEstimated = false;
+
+  if (region === 'sleep') {
+    // Prefer the SleepSession's recorded drain rate if the cursor lands
+    // inside a known sleep. Fall back to the percent-delta estimate from
+    // the enclosing gap, if any.
+    const sleep = sleepSessions.find((s) => {
+      const wake = s.wakeAt ?? windowEndTs;
+      return s.sleepAt <= ts && ts <= wake;
+    });
+    if (sleep && sleep.drainRateMw != null && Number.isFinite(sleep.drainRateMw)) {
+      rateLabel = `${(sleep.drainRateMw / 1000).toFixed(2)} W`;
+      rateEstimated = true;
+    } else {
+      const gap = gaps.find((g) => g.startTs <= ts && ts <= g.endTs);
+      if (gap) {
+        const est = estimatePercentPerHour(history, gap.startTs, gap.endTs);
+        if (est != null) {
+          rateLabel = `${est.toFixed(2)} %/h`;
+          rateEstimated = true;
+        }
+      }
+    }
+  } else if (region === 'interpolated') {
+    const gap = gaps.find((g) => g.startTs <= ts && ts <= g.endTs);
+    if (gap) {
+      const est = estimatePercentPerHour(history, gap.startTs, gap.endTs);
+      if (est != null) {
+        rateLabel = `${est.toFixed(2)} %/h`;
+        rateEstimated = true;
+      }
+    }
+  } else if (interp) {
+    rateLabel = `${interp.rateW.toFixed(2)} W`;
+  }
+
+  return { region, percent, rateLabel, rateEstimated };
+}
+
+// Estimate percent-per-hour across a gap by reading the history percent
+// at the gap boundaries. Returns null if we can't bracket the gap.
+function estimatePercentPerHour(
+  history: HistoryPoint[],
+  startTs: number,
+  endTs: number,
+): number | null {
+  const a = interpolateHistoryAt(history, startTs);
+  const b = interpolateHistoryAt(history, endTs);
+  if (!a || !b) return null;
+  const dtHours = (endTs - startTs) / 3600;
+  if (dtHours <= 0) return null;
+  return (b.percent - a.percent) / dtHours;
+}
+
+function formatFullTimestamp(ts: number): string {
+  return new Date(ts * 1000).toLocaleString(undefined, {
+    weekday: 'short',
+    month: 'short',
+    day: 'numeric',
+    hour: 'numeric',
+    minute: '2-digit',
+    hour12: true,
+  });
+}
+
+function RegionDot({ region }: { region: HoverRegion }) {
+  const colors: Record<HoverRegion, string> = {
+    charging: 'rgb(34, 197, 94)',
+    sleep: 'rgb(139, 92, 246)',
+    interpolated: 'var(--text-muted)',
+    discharge: 'var(--accent)',
+    idle: 'var(--text-subtle)',
+  };
+  return (
+    <span
+      style={{
+        width: 8,
+        height: 8,
+        borderRadius: '50%',
+        background: colors[region],
+        display: 'inline-block',
+        flexShrink: 0,
+      }}
+    />
+  );
 }
 
 function addDays(d: Date, n: number): Date {

@@ -1,7 +1,7 @@
 {
   "name": "bugjuice",
   "private": true,
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "BugJuice frontend prototype — Windows 11 battery monitoring UI",
   "type": "module",
   "scripts": {
