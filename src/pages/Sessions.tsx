@@ -105,6 +105,56 @@ export function Sessions() {
     [gaps],
   );
 
+  // ── Component chart: no-data region detection ──────────────────────
+  // Walk componentHistory and emit bands where there's no data so we can
+  // paint diagonal hatching over them (same treatment as battery gaps).
+  const componentNoDataRegions = useMemo(() => {
+    const ch = data?.componentHistory ?? [];
+    const regions: { startTs: number; endTs: number }[] = [];
+    if (ch.length === 0) {
+      regions.push({ startTs: windowStartTs, endTs: windowEndTs });
+      return regions;
+    }
+    if (ch[0].ts - windowStartTs > GAP_THRESHOLD)
+      regions.push({ startTs: windowStartTs, endTs: ch[0].ts });
+    for (let i = 0; i < ch.length - 1; i++) {
+      if (ch[i + 1].ts - ch[i].ts > GAP_THRESHOLD)
+        regions.push({ startTs: ch[i].ts, endTs: ch[i + 1].ts });
+    }
+    if (windowEndTs - ch[ch.length - 1].ts > GAP_THRESHOLD)
+      regions.push({ startTs: ch[ch.length - 1].ts, endTs: windowEndTs });
+    return regions;
+  }, [data?.componentHistory, windowStartTs, windowEndTs, GAP_THRESHOLD]);
+
+  // Inject null rows at each interior gap so Recharts breaks the area
+  // instead of drawing a line straight across the missing period.
+  const processedComponentHistory = useMemo(() => {
+    const ch = data?.componentHistory ?? [];
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const out: any[] = [];
+    for (let i = 0; i < ch.length; i++) {
+      out.push(ch[i]);
+      if (i < ch.length - 1 && ch[i + 1].ts - ch[i].ts > GAP_THRESHOLD) {
+        out.push({ ts: ch[i].ts + 1, cpu: null, gpu: null, dram: null, other: null });
+        out.push({ ts: ch[i + 1].ts - 1, cpu: null, gpu: null, dram: null, other: null });
+      }
+    }
+    return out;
+  }, [data?.componentHistory, GAP_THRESHOLD]);
+
+  // ── Week view: per-day slices for squircle mini-charts ────────────
+  const daySlices = useMemo(() => {
+    if (viewMode !== 'week') return [] as Array<{ day: Date; dayStart: number; dayEnd: number; pts: HistoryPoint[]; hasData: boolean }>;
+    return Array.from({ length: 7 }, (_, i) => {
+      const day = addDays(weekStart, i);
+      day.setHours(0, 0, 0, 0);
+      const dayStart = Math.floor(day.getTime() / 1000);
+      const dayEnd = dayStart + 86399;
+      const pts = history.filter((p) => p.ts >= dayStart && p.ts <= dayEnd);
+      return { day, dayStart, dayEnd, pts, hasData: pts.length > 0 };
+    });
+  }, [viewMode, weekStart, history]);
+
   // Summary stats — derives avg/peak drain from the history series so
   // live (in-progress) sessions count and the numbers scope cleanly to
   // the visible window.
@@ -189,38 +239,48 @@ export function Sessions() {
     }
   };
 
-  // ── Cursor overlay: map pointer position to a timestamp inside the
-  // window so we can show a tooltip anywhere, including inside sleep /
-  // interpolated / charging bands where Recharts' built-in Tooltip snaps
-  // to the nearest data point and misses the gap regions entirely.
+  // ── Cursor overlay (day / custom view only) ───────────────────────
+  // Maps pointer position to a timestamp so we can show a tooltip
+  // anywhere including inside gap / sleep / charging bands where
+  // Recharts' built-in Tooltip snaps to the nearest data point.
+  // rAF-throttled: we only call setState once per animation frame so
+  // fast mousemove events don't trigger a re-render on every event.
   const chartContainerRef = useRef<HTMLDivElement>(null);
+  const rafRef = useRef<number | null>(null);
+  const pendingMouseX = useRef<number | null>(null);
   const [hoverTs, setHoverTs] = useState<number | null>(null);
   const [hoverClientX, setHoverClientX] = useState<number | null>(null);
 
+  // Cancel any pending rAF on unmount
+  useEffect(() => () => { if (rafRef.current !== null) cancelAnimationFrame(rafRef.current); }, []);
+
   const handleChartMouseMove = (e: ReactMouseEvent<HTMLDivElement>) => {
-    const container = chartContainerRef.current;
-    if (!container || history.length === 0) return;
-    const rect = container.getBoundingClientRect();
-    const relX = e.clientX - rect.left;
-    // Plot area width = container width minus the Y-axis gutter on the
-    // left and the right margin. Recharts' default YAxis width is 40px
-    // (configured above), and we pass `left: -8` in the chart margin so
-    // the actual plot left edge is at ~32px, right edge at container
-    // width minus 12. Keep these in sync with CHART_MARGIN below.
-    const plotLeft = 40 + CHART_MARGIN.left;
-    const plotRight = rect.width - CHART_MARGIN.right;
-    if (relX < plotLeft || relX > plotRight) {
-      setHoverTs(null);
-      setHoverClientX(null);
-      return;
-    }
-    const frac = (relX - plotLeft) / Math.max(1, plotRight - plotLeft);
-    const ts = Math.round(windowStartTs + frac * (windowEndTs - windowStartTs));
-    setHoverTs(ts);
-    setHoverClientX(relX);
+    pendingMouseX.current = e.clientX;
+    if (rafRef.current !== null) return; // already scheduled
+    rafRef.current = requestAnimationFrame(() => {
+      rafRef.current = null;
+      const clientX = pendingMouseX.current;
+      if (clientX === null) return;
+      const container = chartContainerRef.current;
+      if (!container || history.length === 0) return;
+      const rect = container.getBoundingClientRect();
+      const relX = clientX - rect.left;
+      const plotLeft = 40 + CHART_MARGIN.left;
+      const plotRight = rect.width - CHART_MARGIN.right;
+      if (relX < plotLeft || relX > plotRight) {
+        setHoverTs(null);
+        setHoverClientX(null);
+        return;
+      }
+      const frac = (relX - plotLeft) / Math.max(1, plotRight - plotLeft);
+      setHoverTs(Math.round(windowStartTs + frac * (windowEndTs - windowStartTs)));
+      setHoverClientX(relX);
+    });
   };
 
   const handleChartMouseLeave = () => {
+    if (rafRef.current !== null) { cancelAnimationFrame(rafRef.current); rafRef.current = null; }
+    pendingMouseX.current = null;
     setHoverTs(null);
     setHoverClientX(null);
   };
@@ -348,17 +408,91 @@ export function Sessions() {
         />
       </section>
 
-      {/* ─── Battery timeline chart ────────────────────────────────── */}
+      {/* ─── Week view: 7 squircle mini-charts ───────────────────────── */}
+      {viewMode === 'week' && (
+        <section className="card">
+          <div className="card-header">
+            <div>
+              <div className="card-title">Battery timeline</div>
+              <div className="card-subtitle">Click a day to explore it</div>
+            </div>
+            {loading && <span className="badge" style={{ fontSize: 11 }}>loading...</span>}
+          </div>
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(7, 1fr)', gap: 10 }}>
+            {daySlices.map(({ day, pts, hasData }, i) => (
+              <div
+                key={i}
+                onClick={() => { setSelectedDay(new Date(day)); setViewMode('day'); }}
+                style={{
+                  borderRadius: 16,
+                  overflow: 'hidden',
+                  border: '1px solid var(--border)',
+                  background: 'var(--bg-card)',
+                  cursor: 'pointer',
+                  height: 160,
+                  display: 'flex',
+                  flexDirection: 'column',
+                  transition: 'border-color 0.15s, box-shadow 0.15s',
+                }}
+                onMouseEnter={(e) => {
+                  const el = e.currentTarget as HTMLDivElement;
+                  el.style.borderColor = 'var(--accent)';
+                  el.style.boxShadow = '0 0 0 1px var(--accent), 0 4px 16px rgba(0,0,0,0.25)';
+                }}
+                onMouseLeave={(e) => {
+                  const el = e.currentTarget as HTMLDivElement;
+                  el.style.borderColor = 'var(--border)';
+                  el.style.boxShadow = 'none';
+                }}
+              >
+                <div style={{ padding: '8px 10px 4px', fontSize: 11, fontWeight: 600, color: 'var(--text-muted)', flexShrink: 0 }}>
+                  {day.toLocaleDateString(undefined, { weekday: 'short', month: 'numeric', day: 'numeric' })}
+                </div>
+                <div style={{ flex: 1, minHeight: 0 }}>
+                  {hasData ? (
+                    <ResponsiveContainer width="100%" height="100%">
+                      <AreaChart data={pts} margin={{ top: 4, right: 6, left: -30, bottom: 0 }}>
+                        <defs>
+                          <linearGradient id={`dayFill-${i}`} x1="0" y1="0" x2="0" y2="1">
+                            <stop offset="5%" stopColor="var(--accent)" stopOpacity={0.35} />
+                            <stop offset="95%" stopColor="var(--accent)" stopOpacity={0.02} />
+                          </linearGradient>
+                        </defs>
+                        <XAxis dataKey="ts" hide />
+                        <YAxis domain={[0, 100]} hide />
+                        <Area
+                          type="monotone"
+                          dataKey="percent"
+                          stroke="var(--accent)"
+                          strokeWidth={1.5}
+                          fill={`url(#dayFill-${i})`}
+                          dot={false}
+                          isAnimationActive={false}
+                        />
+                      </AreaChart>
+                    </ResponsiveContainer>
+                  ) : (
+                    <div style={{ height: '100%', display: 'flex', alignItems: 'center', justifyContent: 'center', color: 'var(--text-muted)', fontSize: 11 }}>
+                      No data
+                    </div>
+                  )}
+                </div>
+              </div>
+            ))}
+          </div>
+        </section>
+      )}
+
+      {/* ─── Day / custom: full battery timeline chart ────────────────── */}
+      {viewMode !== 'week' && (
       <section className="card">
         <div className="card-header">
           <div>
             <div className="card-title">Battery timeline</div>
             <div className="card-subtitle">
-              {viewMode === 'week'
-                ? 'Click a point to drill into that day'
-                : viewMode === 'day'
-                  ? 'Hourly battery percentage'
-                  : 'Battery percentage over selected range'}
+              {viewMode === 'day'
+                ? 'Hourly battery percentage'
+                : 'Battery percentage over selected range'}
             </div>
           </div>
           {loading && (
@@ -617,14 +751,10 @@ export function Sessions() {
             {interpolatedGaps.length > 0 && (
               <LegendItem color="" label="Interpolated" hatched />
             )}
-            {viewMode === 'week' && (
-              <span style={{ marginLeft: 'auto', fontStyle: 'italic' }}>
-                Click chart to view a single day
-              </span>
-            )}
           </div>
         )}
       </section>
+      )}
 
       {/* ─── Component power chart ─────────────────────────────────── */}
       <section className="card">
@@ -652,7 +782,7 @@ export function Sessions() {
             </div>
           ) : (
             <ResponsiveContainer width="100%" height="100%">
-              <AreaChart data={data!.componentHistory} margin={{ top: 10, right: 12, left: -8, bottom: 0 }}>
+              <AreaChart data={processedComponentHistory} margin={{ top: 10, right: 12, left: -8, bottom: 0 }}>
                 <defs>
                   {(['cpu', 'gpu', 'dram', 'other'] as const).map((key, i) => {
                     const colors = ['var(--chart-1)', 'var(--chart-4)', 'var(--chart-5)', 'var(--chart-2)'];
@@ -663,19 +793,39 @@ export function Sessions() {
                       </linearGradient>
                     );
                   })}
+                  <pattern id="compHatch" patternUnits="userSpaceOnUse" width="8" height="8" patternTransform="rotate(45)">
+                    <rect width="8" height="8" fill="rgba(255,255,255,0.03)" />
+                    <line x1="0" y1="0" x2="0" y2="8" stroke="var(--text-muted)" strokeWidth="1.5" strokeOpacity="0.22" />
+                  </pattern>
                 </defs>
                 <CartesianGrid strokeDasharray="3 3" stroke="var(--border)" vertical={false} />
-                <XAxis dataKey="ts" tickFormatter={formatAxisTime} stroke="var(--text-muted)" fontSize={11} tickLine={false} />
+                <XAxis
+                  dataKey="ts"
+                  type="number"
+                  domain={[windowStartTs, windowEndTs]}
+                  scale="linear"
+                  ticks={xTicks}
+                  tickFormatter={formatAxisTime}
+                  stroke="var(--text-muted)"
+                  fontSize={11}
+                  tickLine={false}
+                  allowDataOverflow
+                />
                 <YAxis unit=" W" stroke="var(--text-muted)" fontSize={11} tickLine={false} width={48} />
                 <Tooltip
                   contentStyle={tooltipStyle}
                   labelFormatter={(ts: number) => new Date(ts * 1000).toLocaleString()}
-                  formatter={(v: number, name: string) => [`${v.toFixed(2)} W`, name.toUpperCase()]}
+                  formatter={(v: number, name: string) => [`${v != null ? v.toFixed(2) : '--'} W`, name.toUpperCase()]}
                 />
-                <Area type="monotone" dataKey="cpu" stackId="1" stroke="var(--chart-1)" strokeWidth={1.5} fill="url(#sess-fill-cpu)" isAnimationActive={false} name="CPU" />
-                <Area type="monotone" dataKey="gpu" stackId="1" stroke="var(--chart-4)" strokeWidth={1.5} fill="url(#sess-fill-gpu)" isAnimationActive={false} name="GPU" />
-                <Area type="monotone" dataKey="dram" stackId="1" stroke="var(--chart-5)" strokeWidth={1.5} fill="url(#sess-fill-dram)" isAnimationActive={false} name="DRAM" />
-                <Area type="monotone" dataKey="other" stackId="1" stroke="var(--chart-2)" strokeWidth={1.5} fill="url(#sess-fill-other)" isAnimationActive={false} name="Other" />
+                <Area type="monotone" dataKey="cpu" stackId="1" stroke="var(--chart-1)" strokeWidth={1.5} fill="url(#sess-fill-cpu)" isAnimationActive={false} connectNulls={false} name="CPU" />
+                <Area type="monotone" dataKey="gpu" stackId="1" stroke="var(--chart-4)" strokeWidth={1.5} fill="url(#sess-fill-gpu)" isAnimationActive={false} connectNulls={false} name="GPU" />
+                <Area type="monotone" dataKey="dram" stackId="1" stroke="var(--chart-5)" strokeWidth={1.5} fill="url(#sess-fill-dram)" isAnimationActive={false} connectNulls={false} name="DRAM" />
+                <Area type="monotone" dataKey="other" stackId="1" stroke="var(--chart-2)" strokeWidth={1.5} fill="url(#sess-fill-other)" isAnimationActive={false} connectNulls={false} name="Other" />
+                {componentNoDataRegions.map((r, i) => {
+                  const band = clampBand(r.startTs, r.endTs, windowStartTs, windowEndTs);
+                  if (!band) return null;
+                  return <ReferenceArea key={`cnd-${i}`} x1={band[0]} x2={band[1]} fill="url(#compHatch)" fillOpacity={1} isFront />;
+                })}
               </AreaChart>
             </ResponsiveContainer>
           )}
