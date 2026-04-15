@@ -143,17 +143,86 @@ export function Sessions() {
   }, [data?.componentHistory, GAP_THRESHOLD]);
 
   // ── Week view: per-day slices for squircle mini-charts ────────────
+  // Each slice carries:
+  //   • pts      — in-day history points, topped and tailed with synthetic
+  //                boundary points so the area spans the full day instead
+  //                of snapping to the first/last real point. Boundary points
+  //                come from interpolateHistoryAt against the whole window,
+  //                so adjacent-day data bleeds into this day's curve — that
+  //                is what "interpolated data between days" means visually.
+  //                If inDay is empty, the two boundary points become a pure
+  //                linear interpolation across the whole day (flat if the
+  //                day falls outside history bounds).
+  //   • dayGaps  — interpolated gap bands clamped to the day, so each
+  //                squircle can hatch its own no-data regions the same way
+  //                the full day/custom chart does.
   const daySlices = useMemo(() => {
-    if (viewMode !== 'week') return [] as Array<{ day: Date; dayStart: number; dayEnd: number; pts: HistoryPoint[]; hasData: boolean }>;
+    if (viewMode !== 'week') {
+      return [] as Array<{
+        day: Date;
+        dayStart: number;
+        dayEnd: number;
+        pts: HistoryPoint[];
+        hasData: boolean;
+        dayGaps: GapRegion[];
+      }>;
+    }
     return Array.from({ length: 7 }, (_, i) => {
       const day = addDays(weekStart, i);
       day.setHours(0, 0, 0, 0);
       const dayStart = Math.floor(day.getTime() / 1000);
       const dayEnd = dayStart + 86399;
-      const pts = history.filter((p) => p.ts >= dayStart && p.ts <= dayEnd);
-      return { day, dayStart, dayEnd, pts, hasData: pts.length > 0 };
+      const inDay = history.filter((p) => p.ts >= dayStart && p.ts <= dayEnd);
+
+      const pts: HistoryPoint[] = [];
+      const startInterp = interpolateHistoryAt(history, dayStart);
+      if (startInterp && (inDay.length === 0 || inDay[0].ts > dayStart)) {
+        pts.push({ ts: dayStart, percent: startInterp.percent, rateW: startInterp.rateW });
+      }
+      pts.push(...inDay);
+      const endInterp = interpolateHistoryAt(history, dayEnd);
+      if (endInterp && (inDay.length === 0 || inDay[inDay.length - 1].ts < dayEnd)) {
+        pts.push({ ts: dayEnd, percent: endInterp.percent, rateW: endInterp.rateW });
+      }
+
+      // `gaps` only captures gaps BETWEEN consecutive history points, so
+      // the leading tail (before history[0]) and trailing tail (after the
+      // last point) of the window don't appear there. Add those explicitly
+      // below so pure-extrapolation days still show hatching.
+      const dayGaps: GapRegion[] = [];
+      for (const g of gaps) {
+        if (g.type !== 'interpolated') continue;
+        const lo = Math.max(g.startTs, dayStart);
+        const hi = Math.min(g.endTs, dayEnd);
+        if (hi > lo) dayGaps.push({ startTs: lo, endTs: hi, type: 'interpolated' });
+      }
+      if (history.length > 0) {
+        const firstTs = history[0].ts;
+        const lastTs = history[history.length - 1].ts;
+        if (dayStart < firstTs) {
+          const hi = Math.min(firstTs, dayEnd);
+          if (hi - dayStart > GAP_THRESHOLD) {
+            dayGaps.push({ startTs: dayStart, endTs: hi, type: 'interpolated' });
+          }
+        }
+        if (dayEnd > lastTs) {
+          const lo = Math.max(lastTs, dayStart);
+          if (dayEnd - lo > GAP_THRESHOLD) {
+            dayGaps.push({ startTs: lo, endTs: dayEnd, type: 'interpolated' });
+          }
+        }
+      }
+
+      return {
+        day,
+        dayStart,
+        dayEnd,
+        pts,
+        hasData: pts.length > 0,
+        dayGaps,
+      };
     });
-  }, [viewMode, weekStart, history]);
+  }, [viewMode, weekStart, history, gaps, GAP_THRESHOLD]);
 
   // Summary stats — derives avg/peak drain from the history series so
   // live (in-progress) sessions count and the numbers scope cleanly to
@@ -226,17 +295,6 @@ export function Sessions() {
       return d.toLocaleTimeString(undefined, { hour: 'numeric', minute: '2-digit', hour12: true });
     }
     return d.toLocaleDateString(undefined, { weekday: 'short', hour: 'numeric', hour12: true });
-  };
-
-  // Handle chart click for day drill-down
-  const handleChartClick = (e: { activePayload?: Array<{ payload: { ts: number } }> } | null) => {
-    if (viewMode === 'week' && e?.activePayload?.[0]) {
-      const ts = e.activePayload[0].payload.ts;
-      const clickedDate = new Date(ts * 1000);
-      clickedDate.setHours(0, 0, 0, 0);
-      setSelectedDay(clickedDate);
-      setViewMode('day');
-    }
   };
 
   // ── Cursor overlay (day / custom view only) ───────────────────────
@@ -419,7 +477,7 @@ export function Sessions() {
             {loading && <span className="badge" style={{ fontSize: 11 }}>loading...</span>}
           </div>
           <div style={{ display: 'grid', gridTemplateColumns: 'repeat(7, 1fr)', gap: 10 }}>
-            {daySlices.map(({ day, pts, hasData }, i) => (
+            {daySlices.map(({ day, dayStart, dayEnd, pts, hasData, dayGaps }, i) => (
               <div
                 key={i}
                 onClick={() => { setSelectedDay(new Date(day)); setViewMode('day'); }}
@@ -457,9 +515,46 @@ export function Sessions() {
                             <stop offset="5%" stopColor="var(--accent)" stopOpacity={0.35} />
                             <stop offset="95%" stopColor="var(--accent)" stopOpacity={0.02} />
                           </linearGradient>
+                          <pattern
+                            id={`sqHatch-${i}`}
+                            patternUnits="userSpaceOnUse"
+                            width="6"
+                            height="6"
+                            patternTransform="rotate(45)"
+                          >
+                            <rect width="6" height="6" fill="transparent" />
+                            <line
+                              x1="0" y1="0" x2="0" y2="6"
+                              stroke="var(--text-muted)"
+                              strokeWidth="1.2"
+                              strokeOpacity="0.3"
+                            />
+                          </pattern>
                         </defs>
-                        <XAxis dataKey="ts" hide />
+                        {/* Explicit numeric time axis locked to the day's
+                            bounds. Without `type="number"` Recharts treats
+                            the ts column as categorical and spaces points
+                            equally — which was exactly why the curve did not
+                            line up with wall-clock time between days. */}
+                        <XAxis
+                          dataKey="ts"
+                          type="number"
+                          domain={[dayStart, dayEnd]}
+                          scale="linear"
+                          allowDataOverflow
+                          hide
+                        />
                         <YAxis domain={[0, 100]} hide />
+                        {dayGaps.map((g, gi) => (
+                          <ReferenceArea
+                            key={`sq-gap-${i}-${gi}`}
+                            x1={g.startTs}
+                            x2={g.endTs}
+                            fill={`url(#sqHatch-${i})`}
+                            fillOpacity={1}
+                            isFront
+                          />
+                        ))}
                         <Area
                           type="monotone"
                           dataKey="percent"
@@ -525,8 +620,6 @@ export function Sessions() {
               <ComposedChart
                 data={history}
                 margin={CHART_MARGIN}
-                onClick={handleChartClick}
-                style={viewMode === 'week' ? { cursor: 'pointer' } : undefined}
               >
                 <defs>
                   <linearGradient id="timelineFill" x1="0" y1="0" x2="0" y2="1">

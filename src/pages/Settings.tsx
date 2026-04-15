@@ -538,7 +538,7 @@ export function Settings() {
         >
           <div>
             <strong style={{ color: 'var(--text)' }}>BugJuice</strong> by
-            DudieBug — v1.0.0
+            DudieBug — v1.0.2
           </div>
           <div style={{ marginTop: 6 }}>
             Open source battery monitoring for Windows. Built with Tauri,
