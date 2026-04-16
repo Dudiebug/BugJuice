@@ -4,7 +4,7 @@
   "version": "1.0.2",
   "identifier": "com.dudiebug.bugjuice",
   "build": {
-    "frontendDist": "../dist",
+    "frontendDist": "C:/Users/dudie/AppData/Local/bugjuice-dist",
     "devUrl": "http://localhost:5173",
     "beforeDevCommand": "npm run build",
     "beforeBuildCommand": "npm run build"

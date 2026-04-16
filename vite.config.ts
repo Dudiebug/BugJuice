@@ -4,9 +4,15 @@ import path from 'path';
 
 export default defineConfig({
   plugins: [react()],
+  build: {
+    // Output outside the OneDrive-synced Documents tree; OneDrive's filter
+    // driver intercepts writes to any path rooted there, even through junctions.
+    outDir: 'C:/Users/dudie/AppData/Local/bugjuice-dist',
+  },
   resolve: {
     alias: {
       '@': path.resolve(__dirname, './src'),
+      'tiny-invariant': path.resolve(__dirname, 'node_modules/tiny-invariant/dist/tiny-invariant.cjs.js'),
     },
   },
   server: {
