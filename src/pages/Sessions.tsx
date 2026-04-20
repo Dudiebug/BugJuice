@@ -33,6 +33,7 @@ export function Sessions() {
   const [customEnd, setCustomEnd] = useState('');
   const [data, setData] = useState<UnifiedTimeline | null>(null);
   const [loading, setLoading] = useState(true);
+  const [neighborHistory, setNeighborHistory] = useState<HistoryPoint[]>([]);
 
   // Window bounds for the current view. Lifted out of the fetch effect so
   // the chart, stats, and cursor overlay can all share the same numeric
@@ -56,6 +57,28 @@ export function Sessions() {
       cancelled = true;
     };
   }, [windowStartTs, windowEndTs]);
+
+  // Neighbour-window history — ±24h bleed used ONLY to source boundary
+  // points for the chart line so it bridges through leading/trailing
+  // interpolated tails instead of truncating at the first/last real
+  // point. We intentionally discard the other fields in the response
+  // (sessions, component history, app power summary) because the main
+  // fetch above already returns window-accurate versions of those, and
+  // app_power_summary is aggregated per-window on the backend so
+  // widening it would pollute the displayed summary.
+  useEffect(() => {
+    if (viewMode === 'week') {
+      setNeighborHistory([]);
+      return;
+    }
+    let cancelled = false;
+    getUnifiedTimeline(windowStartTs - 86400, windowEndTs + 86400).then((d) => {
+      if (!cancelled) setNeighborHistory(d.history);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [viewMode, windowStartTs, windowEndTs]);
 
   // Derived data
   const { history, batterySessions, sleepSessions } = data ?? {
@@ -100,10 +123,51 @@ export function Sessions() {
     return result;
   }, [history, sleepSessions, GAP_THRESHOLD]);
 
-  const interpolatedGaps = useMemo(
-    () => gaps.filter((g) => g.type === 'interpolated'),
-    [gaps],
+  // Day / custom view gaps: interior interpolated gaps plus
+  // leading/trailing tails so sparse windows still hatch the empty
+  // regions before history[0] / after history[last]. Tails that
+  // overlap a sleep session are skipped so the sleep band renders
+  // cleanly instead of fighting the hatching.
+  const dayViewGaps = useMemo(
+    () => computeInterpolatedWithTails(
+      windowStartTs, windowEndTs, history, gaps, sleepSessions, GAP_THRESHOLD,
+    ),
+    [windowStartTs, windowEndTs, history, gaps, sleepSessions, GAP_THRESHOLD],
   );
+
+  // Chart data for the single-day / custom line. Prepends / appends
+  // synthetic boundary points at windowStartTs / windowEndTs so the
+  // line extends through leading and trailing interpolated tails
+  // instead of truncating at the first/last real point. Boundary values
+  // come from interpolateHistoryAt against `neighborHistory` (±24h
+  // bleed) — that gives a true bridge to adjacent-day data when it
+  // exists, and flat extrapolation otherwise (interpolateHistoryAt
+  // clamps to the nearest-edge value when ts is outside the array).
+  const chartHistory = useMemo(() => {
+    if (viewMode === 'week') return history;
+    const lookup = neighborHistory.length > 0 ? neighborHistory : history;
+    if (lookup.length === 0) return history;
+
+    const pts: HistoryPoint[] = [];
+    const needsLeading = history.length === 0 || history[0].ts > windowStartTs;
+    const needsTrailing =
+      history.length === 0 || history[history.length - 1].ts < windowEndTs;
+
+    if (needsLeading) {
+      const leading = interpolateHistoryAt(lookup, windowStartTs);
+      if (leading) {
+        pts.push({ ts: windowStartTs, percent: leading.percent, rateW: leading.rateW });
+      }
+    }
+    pts.push(...history);
+    if (needsTrailing) {
+      const trailing = interpolateHistoryAt(lookup, windowEndTs);
+      if (trailing) {
+        pts.push({ ts: windowEndTs, percent: trailing.percent, rateW: trailing.rateW });
+      }
+    }
+    return pts;
+  }, [history, neighborHistory, viewMode, windowStartTs, windowEndTs]);
 
   // ── Component chart: no-data region detection ──────────────────────
   // Walk componentHistory and emit bands where there's no data so we can
@@ -165,8 +229,11 @@ export function Sessions() {
         pts: HistoryPoint[];
         hasData: boolean;
         dayGaps: GapRegion[];
+        chargingInDay: Array<[number, number]>;
+        sleepInDay: Array<[number, number]>;
       }>;
     }
+    const now = Math.floor(Date.now() / 1000);
     return Array.from({ length: 7 }, (_, i) => {
       const day = addDays(weekStart, i);
       day.setHours(0, 0, 0, 0);
@@ -185,32 +252,19 @@ export function Sessions() {
         pts.push({ ts: dayEnd, percent: endInterp.percent, rateW: endInterp.rateW });
       }
 
-      // `gaps` only captures gaps BETWEEN consecutive history points, so
-      // the leading tail (before history[0]) and trailing tail (after the
-      // last point) of the window don't appear there. Add those explicitly
-      // below so pure-extrapolation days still show hatching.
-      const dayGaps: GapRegion[] = [];
-      for (const g of gaps) {
-        if (g.type !== 'interpolated') continue;
-        const lo = Math.max(g.startTs, dayStart);
-        const hi = Math.min(g.endTs, dayEnd);
-        if (hi > lo) dayGaps.push({ startTs: lo, endTs: hi, type: 'interpolated' });
+      const dayGaps = computeInterpolatedWithTails(
+        dayStart, dayEnd, history, gaps, sleepSessions, GAP_THRESHOLD,
+      );
+
+      const chargingInDay: Array<[number, number]> = [];
+      for (const s of chargingSessions) {
+        const band = clampBand(s.startedAt, s.endedAt ?? now, dayStart, dayEnd);
+        if (band) chargingInDay.push(band);
       }
-      if (history.length > 0) {
-        const firstTs = history[0].ts;
-        const lastTs = history[history.length - 1].ts;
-        if (dayStart < firstTs) {
-          const hi = Math.min(firstTs, dayEnd);
-          if (hi - dayStart > GAP_THRESHOLD) {
-            dayGaps.push({ startTs: dayStart, endTs: hi, type: 'interpolated' });
-          }
-        }
-        if (dayEnd > lastTs) {
-          const lo = Math.max(lastTs, dayStart);
-          if (dayEnd - lo > GAP_THRESHOLD) {
-            dayGaps.push({ startTs: lo, endTs: dayEnd, type: 'interpolated' });
-          }
-        }
+      const sleepInDay: Array<[number, number]> = [];
+      for (const s of sleepSessions) {
+        const band = clampBand(s.sleepAt, s.wakeAt ?? now, dayStart, dayEnd);
+        if (band) sleepInDay.push(band);
       }
 
       return {
@@ -220,9 +274,11 @@ export function Sessions() {
         pts,
         hasData: pts.length > 0,
         dayGaps,
+        chargingInDay,
+        sleepInDay,
       };
     });
-  }, [viewMode, weekStart, history, gaps, GAP_THRESHOLD]);
+  }, [viewMode, weekStart, history, gaps, chargingSessions, sleepSessions, GAP_THRESHOLD]);
 
   // Summary stats — derives avg/peak drain from the history series so
   // live (in-progress) sessions count and the numbers scope cleanly to
@@ -477,7 +533,7 @@ export function Sessions() {
             {loading && <span className="badge" style={{ fontSize: 11 }}>loading...</span>}
           </div>
           <div style={{ display: 'grid', gridTemplateColumns: 'repeat(7, 1fr)', gap: 10 }}>
-            {daySlices.map(({ day, dayStart, dayEnd, pts, hasData, dayGaps }, i) => (
+            {daySlices.map(({ day, dayStart, dayEnd, pts, hasData, dayGaps, chargingInDay, sleepInDay }, i) => (
               <div
                 key={i}
                 onClick={() => { setSelectedDay(new Date(day)); setViewMode('day'); }}
@@ -555,6 +611,26 @@ export function Sessions() {
                             isFront
                           />
                         ))}
+                        {chargingInDay.map(([x1, x2], ci) => (
+                          <ReferenceArea
+                            key={`sq-charge-${i}-${ci}`}
+                            x1={x1}
+                            x2={x2}
+                            fill="rgba(34, 197, 94, 0.2)"
+                            fillOpacity={1}
+                            isFront
+                          />
+                        ))}
+                        {sleepInDay.map(([x1, x2], si) => (
+                          <ReferenceArea
+                            key={`sq-sleep-${i}-${si}`}
+                            x1={x1}
+                            x2={x2}
+                            fill="rgba(139, 92, 246, 0.25)"
+                            fillOpacity={1}
+                            isFront
+                          />
+                        ))}
                         <Area
                           type="monotone"
                           dataKey="percent"
@@ -618,7 +694,7 @@ export function Sessions() {
           ) : (
             <ResponsiveContainer width="100%" height="100%">
               <ComposedChart
-                data={history}
+                data={chartHistory}
                 margin={CHART_MARGIN}
               >
                 <defs>
@@ -634,7 +710,7 @@ export function Sessions() {
                     height="8"
                     patternTransform="rotate(45)"
                   >
-                    <rect width="8" height="8" fill="rgba(255, 255, 255, 0.03)" />
+                    <rect width="8" height="8" fill="transparent" />
                     <line
                       x1="0" y1="0" x2="0" y2="8"
                       stroke="var(--text-muted)"
@@ -664,23 +740,19 @@ export function Sessions() {
 
                 {/* Interpolated gap bands (diagonal hatching) — no-data
                     regions that aren't sleep. Rendered first so they sit
-                    behind charging / sleep bands. Bands are clamped to the
-                    window bounds so sessions crossing the window edge still
-                    render their in-window portion. */}
-                {interpolatedGaps.map((g, i) => {
-                  const band = clampBand(g.startTs, g.endTs, windowStartTs, windowEndTs);
-                  if (!band) return null;
-                  return (
-                    <ReferenceArea
-                      key={`interp-${i}`}
-                      x1={band[0]}
-                      x2={band[1]}
-                      fill="url(#hatchInterpolated)"
-                      fillOpacity={1}
-                      isFront
-                    />
-                  );
-                })}
+                    behind charging / sleep bands. `dayViewGaps` already
+                    clamps to the window and adds leading/trailing tails so
+                    sparse windows still hatch their empty regions. */}
+                {dayViewGaps.map((g, i) => (
+                  <ReferenceArea
+                    key={`interp-${i}`}
+                    x1={g.startTs}
+                    x2={g.endTs}
+                    fill="url(#hatchInterpolated)"
+                    fillOpacity={1}
+                    isFront
+                  />
+                ))}
 
                 {/* Charging session bands (green) */}
                 {chargingSessions.map((s, i) => {
@@ -841,7 +913,7 @@ export function Sessions() {
           >
             <LegendItem color="rgba(34, 197, 94, 0.4)" label="Charging" />
             <LegendItem color="rgba(139, 92, 246, 0.4)" label="Sleep" />
-            {interpolatedGaps.length > 0 && (
+            {dayViewGaps.length > 0 && (
               <LegendItem color="" label="Interpolated" hatched />
             )}
           </div>
@@ -887,7 +959,7 @@ export function Sessions() {
                     );
                   })}
                   <pattern id="compHatch" patternUnits="userSpaceOnUse" width="8" height="8" patternTransform="rotate(45)">
-                    <rect width="8" height="8" fill="rgba(255,255,255,0.03)" />
+                    <rect width="8" height="8" fill="transparent" />
                     <line x1="0" y1="0" x2="0" y2="8" stroke="var(--text-muted)" strokeWidth="1.5" strokeOpacity="0.22" />
                   </pattern>
                 </defs>
@@ -1502,6 +1574,61 @@ function clampBand(
   const x1 = Math.max(a, lo);
   const x2 = Math.min(b, hi);
   return x2 > x1 ? [x1, x2] : null;
+}
+
+// Full interpolated-gap coverage for a window. Returns interior gaps
+// (already detected in `gaps`) clamped to [windowStart, windowEnd], plus
+// leading/trailing tails where the window extends beyond history[0] or
+// history[last]. The bare `gaps` array only captures regions between
+// consecutive history points, so sparse days with data only in the
+// middle would otherwise leave morning/evening unhatched.
+//
+// Tails that overlap any known sleep session are suppressed so the sleep
+// band renders cleanly instead of fighting the hatching. This matches
+// how the interior classifier in `gaps` already tags overlapping gaps
+// as 'sleep' (filtered out of the interpolated bucket).
+function computeInterpolatedWithTails(
+  windowStart: number,
+  windowEnd: number,
+  history: HistoryPoint[],
+  gaps: GapRegion[],
+  sleepSessions: SleepSession[],
+  threshold: number,
+): GapRegion[] {
+  const overlapsSleep = (a: number, b: number) =>
+    sleepSessions.some((s) => s.sleepAt < b && (s.wakeAt ?? Infinity) > a);
+
+  const out: GapRegion[] = [];
+  if (history.length === 0) {
+    if (
+      windowEnd - windowStart > threshold &&
+      !overlapsSleep(windowStart, windowEnd)
+    ) {
+      out.push({ startTs: windowStart, endTs: windowEnd, type: 'interpolated' });
+    }
+    return out;
+  }
+  for (const g of gaps) {
+    if (g.type !== 'interpolated') continue;
+    const lo = Math.max(g.startTs, windowStart);
+    const hi = Math.min(g.endTs, windowEnd);
+    if (hi > lo) out.push({ startTs: lo, endTs: hi, type: 'interpolated' });
+  }
+  const firstTs = history[0].ts;
+  const lastTs = history[history.length - 1].ts;
+  if (windowStart < firstTs) {
+    const hi = Math.min(firstTs, windowEnd);
+    if (hi - windowStart > threshold && !overlapsSleep(windowStart, hi)) {
+      out.push({ startTs: windowStart, endTs: hi, type: 'interpolated' });
+    }
+  }
+  if (windowEnd > lastTs) {
+    const lo = Math.max(lastTs, windowStart);
+    if (windowEnd - lo > threshold && !overlapsSleep(lo, windowEnd)) {
+      out.push({ startTs: lo, endTs: windowEnd, type: 'interpolated' });
+    }
+  }
+  return out;
 }
 
 // Linearly interpolate battery percent and rate at a given ts between

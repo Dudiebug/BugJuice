@@ -1,6 +1,6 @@
 [package]
 name = "bugjuice"
-version = "1.0.2"
+version = "1.0.3"
 description = "BugJuice — battery monitoring and analytics for Windows"
 authors = ["DudieBug"]
 license = "MIT"

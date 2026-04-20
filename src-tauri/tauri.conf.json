@@ -1,10 +1,10 @@
 {
   "$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
   "productName": "BugJuice",
-  "version": "1.0.2",
+  "version": "1.0.3",
   "identifier": "com.dudiebug.bugjuice",
   "build": {
-    "frontendDist": "C:/Users/dudie/AppData/Local/bugjuice-dist",
+    "frontendDist": "./dist",
     "devUrl": "http://localhost:5173",
     "beforeDevCommand": "npm run build",
     "beforeBuildCommand": "npm run build"
